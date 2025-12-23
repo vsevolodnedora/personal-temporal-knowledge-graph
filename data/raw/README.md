@@ -1,0 +1,1 @@
+This is where "converstaions.json" should be placed. Make sure its structure is as expected from "../metadata/export_mapping.yaml"

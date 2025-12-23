@@ -1,0 +1,101 @@
+format_version: "chatgpt_2024"
+
+# Conversation-level JSON pointers
+conversation_title_path: "/title"
+conversation_created_path: "/create_time"
+conversation_updated_path: "/update_time"
+conversation_id_path: "/conversation_id"
+
+# Messages container
+messages_path: "/mapping"
+messages_is_mapping: true  # Messages are stored as a dict/mapping
+
+# Message-level JSON pointers (applied to each mapping entry)
+message_id_path: "/id"
+message_role_path: "/message/author/role"
+message_parent_path: "/parent"
+message_created_path: "/message/create_time"
+message_content_path: "/message/content"
+
+# Role normalization mapping
+role_mapping:
+  user: "user"
+  assistant: "assistant"
+  system: "system"
+  tool: "tool"
+
+# Content part classification rules
+# IMPORTANT: These rules are applied AFTER the code transforms content
+# Exception: "thoughts" content is handled as a special case BEFORE transformation
+
+content_part_rules:
+  - part_type: "text"
+    match_path: "/type"
+    match_value: "text"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths: []
+
+  # Code content (AFTER transformation)
+  - part_type: "text"
+    match_path: "/type"
+    match_value: "code"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths:
+      - "/language"
+
+  # Multimodal/image content (AFTER transformation)
+  - part_type: "image"
+    match_path: "/type"
+    match_value: "multimodal_text"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths: []
+
+  # Tool calls (AFTER transformation)
+  - part_type: "tool_call"
+    match_path: "/type"
+    match_value: "tool_call"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths:
+      - "/tool_name"
+      - "/arguments"
+
+  # Tool results (AFTER transformation)
+  - part_type: "tool_result"
+    match_path: "/type"
+    match_value: "tool_result"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths:
+      - "/tool_call_id"
+
+  # Execution output (AFTER transformation)
+  - part_type: "tool_result"
+    match_path: "/type"
+    match_value: "execution_output"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths: []
+
+  # Default fallback - catch anything with a "type" field
+  - part_type: "text"
+    match_path: "/type"
+    match_value: "*"
+    text_extract_path: "/text"
+    mime_type_path: null
+    file_path_path: null
+    metadata_paths: []
+
+# Known attachment-related paths in metadata
+known_attachment_paths:
+  - "/message/metadata/attachments"
+  - "/message/metadata/file_ids"
