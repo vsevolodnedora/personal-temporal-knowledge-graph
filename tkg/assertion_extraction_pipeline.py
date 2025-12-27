@@ -13,7 +13,7 @@ Key Outputs:
 - retractions: explicit user retractions/corrections
 - Full audit trail via llm_extraction_* and entity_canonicalization_* tables
 """
-
+import hashlib
 import json
 import logging
 import re
@@ -24,40 +24,251 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, List
+import pendulum
 
-from tkg.database_base import Database
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
+def get_logger(name: str) -> logging.Logger:
+    """Get or create a logger with standard configuration."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
 
-# Import shared utilities from extraction pipeline
-from tkg.extraction_pipeline import (
-    PipelineConfig,
-    JCS,
-    IDGenerator,
-    TimestampUtils,
-    DatabaseStage1 as BaseDatabase,
-)
-from tkg.hash_utils import HashUtils
-
-# ===| LOGGING |===
-
-from tkg.logger import get_logger
 logger = get_logger(__name__)
 
+class Database:
+    """Interface for the SQLite database."""
+    def __init__(self, database_path: Path):
+        self.database_path = database_path
+        logger.info(f"Opening database {str(database_path)}")
+        self.connection = sqlite3.connect(str(database_path))
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._in_transaction = False
+
+    def begin(self):
+        """Begin transactions."""
+        self._in_transaction = True
+        self.connection.execute("BEGIN TRANSACTION")
+
+    def rollback(self):
+        """Rollback current transactions."""
+        self.connection.rollback()
+        self._in_transaction = False
+
+    def commit(self):
+        """Commit transaction."""
+        if not self._in_transaction:
+            raise RuntimeError("Cannot commit if not in transaction")
+        self.connection.commit()
+        self._in_transaction = False
+
+    def close(self):
+        """Close database connection."""
+        self.connection.close()
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+class JCS:
+    """
+    JSON Canonicalization Scheme (RFC 8785) implementation.
+
+    Provides deterministic JSON serialization for hashing and ID generation.
+    All JSON stored in the database MUST pass through this canonicalizer.
+    """
+
+    @staticmethod
+    def canonicalize(obj: Any) -> str:
+        """Convert Python object to JCS-canonical JSON string."""
+        return JCS._serialize(obj)
+
+    @staticmethod
+    def canonicalize_bytes(obj: Any) -> bytes:
+        """Convert to canonical JSON and encode as UTF-8."""
+        return JCS.canonicalize(obj).encode('utf-8')
+
+    @staticmethod
+    def _serialize(obj: Any) -> str:
+        """Recursively serialize object to JCS-canonical form."""
+        if obj is None:
+            return 'null'
+        elif isinstance(obj, bool):
+            return 'true' if obj else 'false'
+        elif isinstance(obj, int):
+            return str(obj)
+        elif isinstance(obj, float):
+            # Handle special float values
+            if obj != obj:  # NaN
+                raise ValueError("NaN is not allowed in JCS")
+            if obj == float('inf') or obj == float('-inf'):
+                raise ValueError("Infinity is not allowed in JCS")
+            # Use repr for precise float representation, then clean up
+            s = repr(obj)
+            # Normalize scientific notation
+            if 'e' in s or 'E' in s:
+                s = s.lower()
+            return s
+        elif isinstance(obj, str):
+            return JCS._escape_string(obj)
+        elif isinstance(obj, (list, tuple)):
+            items = ','.join(JCS._serialize(item) for item in obj)
+            return f'[{items}]'
+        elif isinstance(obj, dict):
+            # Sort keys by UTF-16 code units (for ASCII, this is same as lexicographic)
+            sorted_keys = sorted(obj.keys(), key=lambda k: k.encode('utf-16-be'))
+            items = ','.join(
+                f'{JCS._escape_string(k)}:{JCS._serialize(obj[k])}'
+                for k in sorted_keys
+            )
+            return '{' + items + '}'
+        else:
+            # Try to convert to a basic type
+            raise TypeError(f"Cannot serialize {type(obj)} to JCS")
+
+    @staticmethod
+    def _escape_string(s: str) -> str:
+        """Escape a string for JSON according to RFC 8785."""
+        result = ['"']
+        for char in s:
+            code = ord(char)
+            if char == '"':
+                result.append('\\"')
+            elif char == '\\':
+                result.append('\\\\')
+            elif char == '\b':
+                result.append('\\b')
+            elif char == '\f':
+                result.append('\\f')
+            elif char == '\n':
+                result.append('\\n')
+            elif char == '\r':
+                result.append('\\r')
+            elif char == '\t':
+                result.append('\\t')
+            elif code < 0x20:
+                # Control characters
+                result.append(f'\\u{code:04x}')
+            else:
+                result.append(char)
+        result.append('"')
+        return ''.join(result)
+
+
+class IDGenerator:
+    """Basic deterministic UUID generation using namespace-based UUIDv5."""
+    def __init__(self, namespace: uuid.UUID):
+        """Initialize with namespace UUID."""
+        self.namespace = namespace
+
+    def generate(self, components: List[Any]) -> str:
+        """Generate UUIDv5 from component array."""
+        encoded = []
+        for c in components:
+            if c is None:
+                encoded.append("__NULL__")
+            elif c == "":
+                encoded.append("__EMPTY__")
+            else:
+                encoded.append(c)
+
+        name = JCS.canonicalize(encoded)
+        return str(uuid.uuid5(self.namespace, name))
+
+
+class HashUtils:
+    """SHA-256 hashing utilities for fingerprints and content hashing."""
+
+    @staticmethod
+    def sha256_hex(data: bytes) -> str:
+        """Compute SHA-256 hash, return lowercase hex string."""
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def sha256_file(path: Path) -> str:
+        """Compute SHA-256 of entire file contents."""
+        hasher = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while chunk := f.read(8192):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def sha256_string(s: str) -> str:
+        """Compute SHA-256 of UTF-8 encoded string."""
+        return HashUtils.sha256_hex(s.encode('utf-8'))
+
+class TimestampUtils:
+    """
+    Store timestamps as canonical UTC ISO-8601 strings with milliseconds:
+    YYYY-MM-DDTHH:MM:SS.sssZ
+    """
+    ISO_UTC_MILLIS = "YYYY-MM-DD[T]HH:mm:ss.SSS[Z]"
+
+    @staticmethod
+    def now_utc() -> str:
+        return pendulum.now("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+    @staticmethod
+    def normalize_to_utc(timestamp: Any, source_tz: str | None = None) -> str | None:
+        if timestamp is None:
+            return None
+
+        try:
+            # Unix timestamp (seconds since epoch) - int or float
+            if isinstance(timestamp, (int, float)):
+                dt = pendulum.from_timestamp(timestamp, tz="UTC")
+                return dt.format(TimestampUtils.ISO_UTC_MILLIS)
+
+            # Python datetime
+            if isinstance(timestamp, datetime):
+                dt = pendulum.instance(timestamp)
+                # If naive datetime, assume source_tz (or UTC)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=pendulum.timezone(source_tz or "UTC"))
+                return dt.in_timezone("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+            # String timestamps (ISO / RFC3339 / some common formats)
+            if isinstance(timestamp, str):
+                s = timestamp.strip()
+                # tz=... is used as the default for naive strings
+                dt = pendulum.parse(s, tz=source_tz or "UTC", strict=False)
+                return dt.in_timezone("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def parse_iso(iso_string: str) -> datetime | None:
+        try:
+            # Returns a pendulum.DateTime (subclass of datetime)
+            return pendulum.parse(iso_string, strict=False)
+        except Exception:
+            return None
+
+    @staticmethod
+    def compare(ts1: str | None, ts2: str | None) -> int:
+        # If you store ONLY canonical strings (YYYY...SSS Z), lexicographic compare is valid
+        if ts1 is None and ts2 is None:
+            return 0
+        if ts1 is None:
+            return 1
+        if ts2 is None:
+            return -1
+        return -1 if ts1 < ts2 else (1 if ts1 > ts2 else 0)
+
+# ===| CONFIGURATION |===
 
 @dataclass
 class Stage3Config:
     """Configuration for Stage 3 pipeline."""
 
     # Database
-    output_file_path: Path = Path("kg.db")
+    output_file_path: Path = field(default_factory=lambda: Path("kg.db"))
     id_namespace: str = "550e8400-e29b-41d4-a716-446655440000"
 
     # Timezone
@@ -95,9 +306,8 @@ class Stage3Config:
     min_text_length: int = 10
 
 
-# ============================================================================
-# ENUMS
-# ============================================================================
+# ==| ENUMS |===
+
 
 class Modality(StrEnum):
     """Assertion modality types."""
@@ -151,9 +361,7 @@ class RetractionType(StrEnum):
     TEMPORAL_BOUND = "temporal_bound"
 
 
-# ============================================================================
-# DATA CLASSES
-# ============================================================================
+# ===| DATA CLASSES |===
 
 @dataclass
 class AssertionCandidate:
@@ -278,9 +486,7 @@ class MessageContext:
     excluded_ranges: list[tuple[int, int]]
 
 
-# ============================================================================
-# STRING SIMILARITY
-# ============================================================================
+# ==| STRING SIMILARITY |===
 
 class StringSimilarity:
     """String similarity utilities for fuzzy matching."""
@@ -338,9 +544,7 @@ class StringSimilarity:
         return 1.0 - (distance / max_len) if max_len > 0 else 1.0
 
 
-# ============================================================================
-# PREDICATE NORMALIZATION
-# ============================================================================
+# ===| PREDICATE NORMALIZATION |===
 
 class PredicateNormalizer:
     """Normalize predicate labels for canonical storage."""
@@ -361,9 +565,8 @@ class PredicateNormalizer:
         return canonical, canonical_norm
 
 
-# ============================================================================
-# DATABASE EXTENSION
-# ============================================================================
+# ===| DATABASE |===
+
 
 class Stage3Database(Database):
     """Database operations for Stage 3."""
@@ -440,7 +643,7 @@ class Stage3Database(Database):
         "entity_canonical_name_history": ["history_id", "entity_id", "run_id", "previous_name", "canonical_name", "selection_method", "confidence", "selected_at_utc", "raw_selection_json"],
     }
 
-    def __init__(self, database_path: Path):
+    def __init__(self, database_path: Path) -> None:
         super().__init__(database_path)
 
     def initialize_stage3_schema(self, overwrite: bool = True):
@@ -1164,9 +1367,7 @@ class Stage3Database(Database):
                                 ))
 
 
-# ============================================================================
-# RULE-BASED EXTRACTOR
-# ============================================================================
+# ===| RULE-BASED EXTRACTOR |===
 
 @dataclass
 class ExtractionPattern:
@@ -1184,6 +1385,15 @@ class ExtractionPattern:
     confidence: float = 0.9
     category: str | None = None
 
+    secondary_group: int | None = None  # For patterns that need multiple capture groups
+
+    # Fixed literal value for object (used when object_group is None but a fixed value is needed)
+    object_literal_value: Any = None
+
+    # Temporal qualifier fields
+    temporal_qualifier_type: str | None = None  # "at", "since", "until", "during"
+    temporal_group: int | None = None  # capture group for temporal expression
+
 
 class RuleBasedExtractor:
     """
@@ -1192,6 +1402,13 @@ class RuleBasedExtractor:
     Patterns are conservative and designed to minimize false positives
     while capturing common personal knowledge assertions.
     """
+
+    # Word to number mapping at class level for reuse
+    WORD_TO_NUMBER = {
+        "zero": 0, "no": 0, "one": 1, "two": 2, "three": 3,
+        "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+        "nine": 9, "ten": 10
+    }
 
     def __init__(self):
         self.patterns: list[ExtractionPattern] = self._build_patterns()
@@ -1234,7 +1451,7 @@ class RuleBasedExtractor:
 
         # === LOCATION PATTERNS ===
 
-        # "I live in [Location]" / "I'm from [Location]" / "I'm based in [Location]"
+        # "I live in [Location]" / "I'm based in [Location]"
         patterns.append(ExtractionPattern(
             pattern_id="location_live_1",
             regex=re.compile(
@@ -1264,11 +1481,11 @@ class RuleBasedExtractor:
             category="location"
         ))
 
-        # "I moved to [Location]"
+        # "I moved to [Location]" - with optional temporal
         patterns.append(ExtractionPattern(
             pattern_id="location_moved_1",
             regex=re.compile(
-                r"\bi\s+(?:moved|relocated)\s+to\s+([A-Z][a-zA-Z\s,]+?)(?:\.|,|$|\s+(?:and|but|in|last))",
+                r"\bi\s+(?:moved|relocated)\s+to\s+([A-Z][a-zA-Z\s,]+?)(?:\s+(?:in|on|last|around)\s+(.+?))?(?:\.|,|$|\s+(?:and|but))",
                 re.IGNORECASE
             ),
             predicate_label="lives_in",
@@ -1276,7 +1493,9 @@ class RuleBasedExtractor:
             object_group=1,
             object_type="LOCATION",
             confidence=0.85,
-            category="location"
+            category="location",
+            temporal_qualifier_type=TemporalQualifierType.SINCE,
+            temporal_group=2
         ))
 
         # === OCCUPATION PATTERNS ===
@@ -1358,6 +1577,23 @@ class RuleBasedExtractor:
             category="employment"
         ))
 
+        # "I started working at [Company] in [Time]" - with temporal
+        patterns.append(ExtractionPattern(
+            pattern_id="employer_3",
+            regex=re.compile(
+                r"\bi\s+(?:started|began)\s+(?:working\s+)?(?:at|for)\s+([A-Z][a-zA-Z\s&.]+?)\s+(?:in|on|around|since)\s+(.+?)(?:\.|,|$)",
+                re.IGNORECASE
+            ),
+            predicate_label="works_at",
+            modality=Modality.STATE,
+            object_group=1,
+            object_type="ORG",
+            confidence=0.9,
+            category="employment",
+            temporal_qualifier_type=TemporalQualifierType.SINCE,
+            temporal_group=2
+        ))
+
         # === PREFERENCE PATTERNS ===
 
         # "I like/love/prefer [Thing]"
@@ -1399,7 +1635,8 @@ class RuleBasedExtractor:
             ),
             predicate_label="favorite",
             modality=Modality.PREFERENCE,
-            object_group=2,  # The thing, not the category
+            object_group=2,
+            secondary_group=1,
             object_type="string",
             confidence=0.85,
             category="preference"
@@ -1481,6 +1718,7 @@ class RuleBasedExtractor:
             predicate_label="studied",
             modality=Modality.FACT,
             object_group=1,
+            secondary_group=2,
             object_type="string",
             confidence=0.85,
             category="education"
@@ -1496,6 +1734,7 @@ class RuleBasedExtractor:
             predicate_label="has_degree",
             modality=Modality.FACT,
             object_group=1,
+            secondary_group=2,
             object_type="string",
             confidence=0.9,
             category="education"
@@ -1504,6 +1743,7 @@ class RuleBasedExtractor:
         # === FAMILY PATTERNS ===
 
         # "I have [Number] [Relation]" (kids, children, siblings, etc.)
+        # Now extracts both count and relation type
         patterns.append(ExtractionPattern(
             pattern_id="family_1",
             regex=re.compile(
@@ -1512,8 +1752,9 @@ class RuleBasedExtractor:
             ),
             predicate_label="has_family_members",
             modality=Modality.STATE,
-            object_group=0,  # Will handle specially
-            object_type="string",
+            object_group=1,
+            secondary_group=2,
+            object_type="number",
             confidence=0.85,
             category="family"
         ))
@@ -1531,6 +1772,24 @@ class RuleBasedExtractor:
             object_type="string",
             confidence=0.9,
             category="family"
+        ))
+
+        # "I got married in [Time]" - with temporal
+        patterns.append(ExtractionPattern(
+            pattern_id="family_3",
+            regex=re.compile(
+                r"\bi\s+got\s+married\s+(?:in|on|around)\s+(.+?)(?:\.|,|$)",
+                re.IGNORECASE
+            ),
+            predicate_label="marital_status",
+            modality=Modality.STATE,
+            object_group=None,  # Unary with temporal
+            object_type=None,
+            object_literal_value="married",
+            confidence=0.9,
+            category="family",
+            temporal_qualifier_type=TemporalQualifierType.SINCE,
+            temporal_group=1
         ))
 
         # === CONTACT PATTERNS ===
@@ -1632,6 +1891,9 @@ class RuleBasedExtractor:
                 object_value = None
                 object_literal_type = None
                 object_entity_ref = None
+                secondary_value = None
+                temporal_surface = None
+                temporal_qualifier_type = None
 
                 if pattern.object_group is not None and pattern.object_group > 0:
                     try:
@@ -1642,9 +1904,10 @@ class RuleBasedExtractor:
                             # Determine if entity or literal
                             if pattern.object_type in ("PERSON", "ORG", "LOCATION", "EMAIL"):
                                 object_entity_ref = object_value
+                                object_value = None  # Clear since it's an entity ref
                             elif pattern.object_type == "number":
                                 object_literal_type = ObjectValueType.NUMBER
-                                # Convert word numbers
+                                # Convert word numbers immediately
                                 object_value = self._word_to_number(object_value)
                             elif pattern.object_type == "date":
                                 object_literal_type = ObjectValueType.DATE
@@ -1652,6 +1915,57 @@ class RuleBasedExtractor:
                                 object_literal_type = ObjectValueType.STRING
                     except IndexError:
                         continue
+                elif pattern.object_literal_value is not None:
+                    # Pattern has a fixed literal value (not captured from regex)
+                    object_value = pattern.object_literal_value
+                    if pattern.object_type == "number":
+                        object_literal_type = ObjectValueType.NUMBER
+                    elif pattern.object_type == "date":
+                        object_literal_type = ObjectValueType.DATE
+                    elif pattern.object_type == "boolean":
+                        object_literal_type = ObjectValueType.BOOLEAN
+                    else:
+                        object_literal_type = ObjectValueType.STRING
+
+                # Extract secondary group if present
+                if pattern.secondary_group is not None:
+                    try:
+                        secondary_value = match.group(pattern.secondary_group)
+                        if secondary_value:
+                            secondary_value = secondary_value.strip()
+                    except IndexError:
+                        pass
+
+                # Extract temporal qualifier if present
+                if pattern.temporal_group is not None:
+                    try:
+                        temporal_surface = match.group(pattern.temporal_group)
+                        if temporal_surface:
+                            temporal_surface = temporal_surface.strip()
+                            temporal_qualifier_type = pattern.temporal_qualifier_type
+                    except IndexError:
+                        pass
+
+                # Special handling for family_1 pattern
+                raw_data = {
+                    "pattern_id": pattern.pattern_id,
+                    "full_match": match.group(0),
+                    "groups": match.groups(),
+                    "category": pattern.category
+                }
+
+                # Add secondary value to raw_data for patterns that use it
+                if secondary_value:
+                    raw_data["secondary_value"] = secondary_value
+                    # For family pattern, create a composite predicate label
+                    if pattern.pattern_id == "family_1":
+                        # Normalize the relation type (e.g., "kids" -> "kid", "children" -> "child")
+                        relation = secondary_value.lower()
+                        if relation.endswith("s") and relation not in ("children",):
+                            relation = relation.rstrip("s")
+                        if relation == "children":
+                            relation = "child"
+                        raw_data["family_relation"] = relation
 
                 candidate = AssertionCandidate(
                     message_id=message_id,
@@ -1664,15 +1978,12 @@ class RuleBasedExtractor:
                     polarity=pattern.polarity,
                     char_start=char_start,
                     char_end=char_end,
+                    temporal_qualifier_type=temporal_qualifier_type,
+                    temporal_qualifier_surface=temporal_surface,
                     extraction_method=ExtractionMethod.RULE_BASED,
                     confidence=pattern.confidence,
                     pattern_id=pattern.pattern_id,
-                    raw_data={
-                        "pattern_id": pattern.pattern_id,
-                        "full_match": match.group(0),
-                        "groups": match.groups(),
-                        "category": pattern.category
-                    }
+                    raw_data=raw_data
                 )
                 candidates.append(candidate)
 
@@ -1701,23 +2012,22 @@ class RuleBasedExtractor:
 
     def _word_to_number(self, word: str) -> Any:
         """Convert word numbers to integers."""
-        word_map = {
-            "zero": 0, "no": 0, "one": 1, "two": 2, "three": 3,
-            "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
-            "nine": 9, "ten": 10
-        }
-        lower = word.lower().strip()
-        if lower in word_map:
-            return word_map[lower]
+        if isinstance(word, (int, float)):
+            return word
+
+        lower = str(word).lower().strip()
+        if lower in self.WORD_TO_NUMBER:
+            return self.WORD_TO_NUMBER[lower]
         try:
-            return int(word)
+            # Try parsing as int first, then float
+            if "." in lower:
+                return float(lower)
+            return int(lower)
         except ValueError:
             return word
 
 
-# ============================================================================
-# LLM EXTRACTOR (SCAFFOLDING)
-# ============================================================================
+# ===| LLM EXTRACTOR (SCAFFOLDING) |===
 
 class LLMExtractor:
     """
@@ -1852,9 +2162,7 @@ class LLMExtractor:
         return candidates
 
 
-# ============================================================================
-# RETRACTION DETECTOR
-# ============================================================================
+# ===| RETRACTION DETECTOR |===
 
 class RetractionDetector:
     """
@@ -1994,9 +2302,7 @@ class RetractionDetector:
         return False
 
 
-# ============================================================================
-# ENTITY RESOLVER
-# ============================================================================
+# ===| ENTITY RESOLVER |===
 
 class EntityResolver:
     """
@@ -2162,9 +2468,7 @@ class EntityResolver:
         return value.strip().lower()
 
 
-# ============================================================================
-# GROUNDING ENGINE
-# ============================================================================
+# ===| GROUNDING ENGINE |===
 
 class GroundingEngine:
     """
@@ -2244,18 +2548,26 @@ class GroundingEngine:
             # Literal object
             object_value_type = candidate.object_literal_type or ObjectValueType.STRING
 
-            # Canonicalize value
+            # Canonicalize value - value is already converted by _word_to_number
+            val = candidate.object_literal_value
+
             if object_value_type == ObjectValueType.NUMBER:
-                try:
-                    parsed = float(candidate.object_literal_value) if "." in str(candidate.object_literal_value) else int(candidate.object_literal_value)
-                except (ValueError, TypeError):
-                    parsed = candidate.object_literal_value
+                # Value should already be a number from _word_to_number
+                if isinstance(val, (int, float)):
+                    parsed = val
+                else:
+                    # Fallback parsing if still a string
+                    try:
+                        val_str = str(val)
+                        parsed = float(val_str) if "." in val_str else int(val_str)
+                    except (ValueError, TypeError):
+                        parsed = val
                 object_value = JCS.canonicalize(parsed)
             elif object_value_type == ObjectValueType.BOOLEAN:
-                parsed = str(candidate.object_literal_value).lower() in ("true", "1", "yes")
+                parsed = str(val).lower() in ("true", "1", "yes")
                 object_value = JCS.canonicalize(parsed)
             else:
-                object_value = JCS.canonicalize(str(candidate.object_literal_value))
+                object_value = JCS.canonicalize(str(val))
 
             # Compute signature
             sig_input = [object_value_type, json.loads(object_value)]
@@ -2273,6 +2585,14 @@ class GroundingEngine:
                 if tm["surface_text"].lower() == candidate.temporal_qualifier_surface.lower():
                     temporal_qualifier_id = tm["time_mention_id"]
                     break
+
+            # If no exact match, try partial match
+            if temporal_qualifier_id is None:
+                for tm in time_mentions:
+                    if (candidate.temporal_qualifier_surface.lower() in tm["surface_text"].lower() or
+                        tm["surface_text"].lower() in candidate.temporal_qualifier_surface.lower()):
+                        temporal_qualifier_id = tm["time_mention_id"]
+                        break
 
         # Get surface text from offsets if available
         surface_text = None
@@ -2304,11 +2624,12 @@ class GroundingEngine:
             }
         }
 
-        if candidate.temporal_qualifier_value:
+        if candidate.temporal_qualifier_type or candidate.temporal_qualifier_value:
             raw_data["temporal_qualifier"] = {
                 "type": temporal_qualifier_type,
                 "surface": candidate.temporal_qualifier_surface,
-                "value": candidate.temporal_qualifier_value
+                "value": candidate.temporal_qualifier_value,
+                "resolved_id": temporal_qualifier_id
             }
 
         # Compute keys
@@ -2359,9 +2680,7 @@ class GroundingEngine:
         )
 
 
-# ============================================================================
-# CORROBORATION DETECTOR
-# ============================================================================
+# ===| CORROBORATION DETECTOR |===
 
 class CorroborationDetector:
     """
@@ -2440,9 +2759,7 @@ class CorroborationDetector:
         return None
 
 
-# ============================================================================
-# CANONICALIZATION REFINER
-# ============================================================================
+# ===| CANONICALIZATION REFINER |===
 
 class CanonicalizationRefiner:
     """
@@ -2607,9 +2924,7 @@ class CanonicalizationRefiner:
         return run_id, entities_processed, names_changed
 
 
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
+# ===| MAIN PIPELINE |===
 
 class AssertionExtractionPipeline:
     """
@@ -2719,11 +3034,18 @@ class AssertionExtractionPipeline:
                 # Parse exclusion ranges
                 excluded_ranges = []
                 if msg.get("code_fence_ranges_json"):
-                    for r in json.loads(msg["code_fence_ranges_json"]):
-                        excluded_ranges.append((r["char_start"], r["char_end"]))
+                    try:
+                        for r in json.loads(msg["code_fence_ranges_json"]):
+                            excluded_ranges.append((r["char_start"], r["char_end"]))
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        logger.warning(f"Failed to parse code_fence_ranges_json for {message_id}: {e}")
+
                 if msg.get("blockquote_ranges_json"):
-                    for r in json.loads(msg["blockquote_ranges_json"]):
-                        excluded_ranges.append((r["char_start"], r["char_end"]))
+                    try:
+                        for r in json.loads(msg["blockquote_ranges_json"]):
+                            excluded_ranges.append((r["char_start"], r["char_end"]))
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        logger.warning(f"Failed to parse blockquote_ranges_json for {message_id}: {e}")
 
                 # Check minimum text length after exclusions
                 effective_length = len(text_raw)
@@ -2999,21 +3321,21 @@ class AssertionExtractionPipeline:
         target_fact_key = None
         replacement_assertion_id = None
 
+        # Try to find target in recent assertions
+        if recent_assertions:
+            target = recent_assertions[-1]
+            target_fact_key = target.fact_key
+
+            # Look up the actual assertion_id from the database
+            existing_assertions = self.db.get_assertions_by_fact_key(target_fact_key)
+            if existing_assertions:
+                target_assertion_id = existing_assertions[0]["assertion_id"]
+
         # For corrections, try to link to replacement
         if rc.retraction_type == RetractionType.CORRECTION and rc.replacement_candidate:
             # The replacement would need to be grounded and persisted
             # This is a simplified implementation
             pass
-
-        # Try to find target in recent assertions
-        # This is a simplified heuristic - full implementation would
-        # parse the retraction content more carefully
-        if recent_assertions:
-            # Just link to most recent for now
-            # A full implementation would analyze the retraction text
-            target = recent_assertions[-1] if recent_assertions else None
-            if target:
-                target_fact_key = target.fact_key
 
         self.db.insert_retraction(
             retraction_id=retraction_id,
@@ -3028,12 +3350,19 @@ class AssertionExtractionPipeline:
             surface_text=rc.surface_text,
             raw_retraction_json=JCS.canonicalize(rc.raw_data)
         )
+        # Mark the target assertion as superseded
+        if target_assertion_id:
+            supersession_type = "retracted" if rc.retraction_type == RetractionType.FULL else rc.retraction_type
+            self.db.update_assertion_supersession(
+                assertion_id=target_assertion_id,
+                superseded_by=replacement_assertion_id or retraction_id,  # Use retraction_id if no replacement
+                supersession_type=supersession_type,
+            )
 
         self.stats["retractions_detected"] += 1
 
-# ============================================================================
-# VALIDATION PILELINE
-# ============================================================================
+# ===| VALIDATION PIPELINE |===
+
 
 class ValidationSeverity(StrEnum):
     """Severity levels for validation issues."""
@@ -3991,19 +4320,13 @@ def validate_stage3(
     return validator.validate()
 
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
 def run_stage3(config: Stage3Config) -> None:
     """Run Stage 3 pipeline on existing database."""
     pipeline = AssertionExtractionPipeline(config)
-    # pipeline.run()
+    pipeline.run()
 
     report = validate_stage3(config.output_file_path, strict=True)
     report.print_summary()
-
-
 
 
 if __name__ == "__main__":

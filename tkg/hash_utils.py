@@ -1,7 +1,6 @@
 import hashlib
 from pathlib import Path
 
-
 class HashUtils:
     """SHA-256 hashing utilities for fingerprints and content hashing."""
 
