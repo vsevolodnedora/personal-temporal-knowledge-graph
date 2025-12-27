@@ -156,8 +156,10 @@ SQLite database with:
 
 ## Project Status
 
-✅ Stage 1: Raw ingestion complete  
-🚧 Stage 2-5: In development  
+✅ Stage 1: Raw ingestion: completed  
+✅ Stage 2: Personal Lexicon Creation: completed  
+✅ Stage 3: Assertion Extraction: completed (without LLM)  
+🚧 Stage 4-5: In development  
 
 ## License
 

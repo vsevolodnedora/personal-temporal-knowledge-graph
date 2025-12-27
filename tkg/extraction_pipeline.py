@@ -24,7 +24,10 @@ import pendulum
 from datetime import datetime
 import yaml
 
-from experiments.exp_v12.logger import get_logger
+from tkg.hash_utils import HashUtils
+from tkg.database_base import Database
+
+from tkg.logger import get_logger
 logger = get_logger(__name__)
 
 # ===| CONFIG |===
@@ -260,28 +263,6 @@ class TimestampUtils:
             return -1
         return -1 if ts1 < ts2 else (1 if ts1 > ts2 else 0)
 
-class HashUtils:
-    """SHA-256 hashing utilities for fingerprints and content hashing."""
-
-    @staticmethod
-    def sha256_hex(data: bytes) -> str:
-        """Compute SHA-256 hash, return lowercase hex string."""
-        return hashlib.sha256(data).hexdigest()
-
-    @staticmethod
-    def sha256_file(path: Path) -> str:
-        """Compute SHA-256 of entire file contents."""
-        hasher = hashlib.sha256()
-        with open(path, 'rb') as f:
-            while chunk := f.read(8192):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-
-    @staticmethod
-    def sha256_string(s: str) -> str:
-        """Compute SHA-256 of UTF-8 encoded string."""
-        return HashUtils.sha256_hex(s.encode('utf-8'))
-
 class TimestampQuality(StrEnum):
     """Quality indicator for message timestamps."""
     ORIGINAL = "original"
@@ -365,37 +346,38 @@ class JSONPointer:
 
 # ===| DATABASE |===
 
-class Database:
+class DatabaseStage1(Database):
     """Interface for the SQLite database."""
+
+    STAGE1_TABLES = {
+        "conversations": ["conversation_id", "export_conversation_id", "title", "created_at_utc", "updated_at_utc", "message_count", "raw_conversation_json"],
+        "messages": [
+            "message_id",
+            "conversation_id",
+            "role",
+            "parent_id",
+            "tree_path",
+            "order_index",
+            "created_at_utc",
+            "timestamp_quality",
+            "content_type",
+            "text_raw",
+            "text_part_map_json",
+            "code_fence_ranges_json",
+            "blockquote_ranges_json",
+            "attachment_count",
+            "raw_message_json",
+        ],
+        "message_parts": ["part_id", "message_id", "part_index", "part_type", "text_content", "mime_type", "file_path", "metadata_json", "raw_part_json"],
+    }
+
     def __init__(self, database_path: Path):
-        self.database_path = database_path
-        self.connection = sqlite3.connect(str(database_path))
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self._in_transaction = False
+        super().__init__(database_path)
 
-    def begin(self):
-        """Begin transactions."""
-        self._in_transaction = True
+    def initialize_schema_stage1(self):
+        """Create all tables and indices."""
+        cursor = self.connection.cursor()
 
-    def rollback(self):
-        """Rollback current transactions."""
-        self.connection.rollback()
-        self._in_transaction = False
-
-    def commit(self):
-        """Commit transaction."""
-        if not self._in_transaction:
-            raise RuntimeError("Cannot commit if not in transaction")
-        self.connection.commit()
-        self._in_transaction = False
-
-    def close(self):
-        """Close database connection."""
-        self.connection.close()
-
-    def _create_conversations_table(self, cursor: sqlite3.Cursor) -> None:
-        # Conversations table
         cursor.execute("""
                        CREATE TABLE IF NOT EXISTS conversations (
                                                                     conversation_id TEXT PRIMARY KEY,
@@ -408,8 +390,6 @@ class Database:
                        )
                        """)
 
-    def _create_messages_table(self, cursor: sqlite3.Cursor) -> None:
-        # Messages table
         cursor.execute("""
                        CREATE TABLE IF NOT EXISTS messages (
                                                                message_id TEXT PRIMARY KEY,
@@ -431,8 +411,6 @@ class Database:
                            )
                        """)
 
-    def _create_message_parts_table(self, cursor: sqlite3.Cursor) -> None:
-        # Message parts table
         cursor.execute("""
                        CREATE TABLE IF NOT EXISTS message_parts (
                                                                     part_id TEXT PRIMARY KEY,
@@ -447,14 +425,6 @@ class Database:
                                                                     FOREIGN KEY (message_id) REFERENCES messages(message_id)
                            )
                        """)
-
-    def initialize_schema(self):
-        """Create all tables and indices."""
-        cursor = self.connection.cursor()
-
-        self._create_conversations_table(cursor)
-        self._create_messages_table(cursor)
-        self._create_message_parts_table(cursor)
 
         # Create indices for common queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)")
@@ -691,7 +661,7 @@ class Database:
 
 class RawIngestStage:
     """Ingesting raw conversations.json into the database."""
-    def __init__(self, database:Database, id_generator:IDGenerator, export_mapping:ExportMapping):
+    def __init__(self, database:DatabaseStage1, id_generator:IDGenerator, export_mapping:ExportMapping):
         self.db = database
         self.id_gen = id_generator
         self.export_mapping = export_mapping
@@ -1331,8 +1301,8 @@ class Pipeline:
         self.id_generator = IDGenerator(uuid.UUID(config.id_namespace))
 
         if os.path.isfile(self.config.output_file_path): os.remove(self.config.output_file_path)
-        self.db = Database(self.config.output_file_path)
-        self.db.initialize_schema()
+        self.db = DatabaseStage1(self.config.output_file_path)
+        self.db.initialize_schema_stage1()
 
         self.export_mapping = ExportMapping.from_yaml(config.export_mapping_path)
 
@@ -1344,7 +1314,7 @@ class Pipeline:
         # Perform ingestion
         self.ingest_pipeline.run(self.config.input_file_path)
 
-        self.db = Database(self.config.output_file_path)
+        self.db = DatabaseStage1(self.config.output_file_path)
         total_text = self.db.get_total_text_chars()
         logger.info(f"Total chars {total_text} ")
 
@@ -1365,13 +1335,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("../data/raw/conversations_sample.json"),
+        default=Path("../data/raw/conversations.json"),
         help="Path to the input conversations JSON file.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("./data/output/kg.db"),
+        default=Path("../data/output/kg.db"),
         help="Path to the output SQLite DB file.",
     )
     parser.add_argument(
@@ -1384,7 +1354,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_pipeline(
-        input_file_path=args.input_file_path,
-        output_file_path=args.output_file_path,
-        export_mapping_path=args.export_mapping_path,
+        input_file_path=args.input,
+        output_file_path=args.output,
+        export_mapping_path=args.export_mapping,
     )
