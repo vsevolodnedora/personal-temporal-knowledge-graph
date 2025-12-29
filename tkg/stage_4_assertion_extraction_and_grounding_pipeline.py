@@ -3,7 +3,7 @@ Stage 4: Assertion Extraction & Grounding Layer
 
 Converts Stage 1-3 evidence (messages + refined entities + time mentions) into
 auditable, replayable assertions with deterministic IDs, conservative span handling,
-and role-aware trust.
+detector-aware entity reliability, and role-aware trust.
 
 Outputs:
 - predicates: normalized relation vocabulary
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum, IntEnum
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Dict, Tuple, Set, Callable
+from typing import Any, Iterator, List, Optional, Dict, Tuple, Set, Callable, NamedTuple
 import unicodedata
 
 try:
@@ -388,6 +388,14 @@ class UpsertPolicy(StrEnum):
     KEEP_ALL = "keep_all"
 
 
+class DetectorTier(IntEnum):
+    """Detector reliability tiers (lower = more reliable)."""
+    TIER_1 = 1  # Highest reliability (e.g., exact match, user-confirmed)
+    TIER_2 = 2  # High reliability (e.g., NER with high confidence)
+    TIER_3 = 3  # Medium reliability (e.g., pattern-based)
+    TIER_4 = 4  # Low reliability (e.g., fuzzy match, fallback)
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -418,6 +426,19 @@ class Stage4Config:
     # Entity linking
     enable_fuzzy_entity_linking: bool = True
     threshold_link_string_sim: float = 0.85
+
+    # Detector-aware grounding
+    detector_grounding_bonus: float = 0.05
+
+    # Salience integration
+    enable_salience_confidence_boost: bool = False
+    salience_confidence_bonus: float = 0.1
+
+    # Temporal validation
+    enable_temporal_bounds_validation: bool = True
+    temporal_bounds_violation_penalty: float = 0.1
+
+    # Predicate matching
     predicate_similarity_threshold: float = 0.9
 
     # Trust weights
@@ -439,6 +460,41 @@ class ExclusionRange:
     char_start: int
     char_end: int
     reason: str = ""
+
+
+@dataclass
+class EntityRecord:
+    """In-memory entity record with detector tier information."""
+    entity_id: str
+    entity_type: str
+    entity_key: str
+    canonical_name: str
+    aliases: List[str]
+    salience_score: Optional[float]
+    mention_count: int
+    conversation_count: int
+    first_seen_at_utc: Optional[str]
+    last_seen_at_utc: Optional[str]
+    best_detector_tier: int  # Computed from mentions (1-4)
+
+
+@dataclass
+class EntityMentionInfo:
+    """Entity mention information for span-based resolution."""
+    entity_id: str
+    char_start: int
+    char_end: int
+    detector: str
+    detector_tier: int
+    confidence: float
+    surface_text: str
+
+
+class EntityResolutionResult(NamedTuple):
+    """Result of entity resolution."""
+    entity_id: str
+    detection_tier: int
+    resolution_confidence: float
 
 
 @dataclass
@@ -470,8 +526,10 @@ class GroundedAssertion:
     assertion_key: str
     fact_key: str
     subject_entity_id: str
+    subject_detection_tier: Optional[int]
     predicate_id: str
     object_entity_id: Optional[str]
+    object_detection_tier: Optional[int]
     object_value_type: Optional[str]
     object_value: Optional[str]
     object_signature: str
@@ -482,6 +540,7 @@ class GroundedAssertion:
     asserted_role: str
     asserted_at_utc: Optional[str]
     confidence_extraction: float
+    confidence_grounding: float
     confidence_final: float
     has_user_corroboration: int
     superseded_by_assertion_id: Optional[str]
@@ -520,6 +579,7 @@ class MessageContext:
     context_messages: List[Dict[str, Any]]
     context_entities: Dict[str, Dict[str, Any]]
     context_times: List[Dict[str, Any]]
+    entity_mention_map: List[EntityMentionInfo]  # For span-based resolution
 
 
 @dataclass
@@ -532,9 +592,26 @@ class ExtractionPattern:
     priority: int
 
 
+@dataclass
+class TemporalBoundsCheck:
+    """Result of temporal bounds validation."""
+    subject_bounds_valid: bool
+    object_bounds_valid: bool
+    penalty_applied: float
+
+
 # =============================================================================
 # DATABASE
 # =============================================================================
+
+def row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    """Safely get a value from sqlite3.Row, returning default if column doesn't exist."""
+    try:
+        value = row[key]
+        return value if value is not None else default
+    except (IndexError, KeyError):
+        return default
+
 
 class Database:
     """Interface for the SQLite database."""
@@ -628,7 +705,7 @@ class Stage4Database(Database):
             ON predicates(canonical_label_norm)
         """)
 
-        # assertions table
+        # assertions table (with detector tier columns per spec)
         self.execute("""
             CREATE TABLE IF NOT EXISTS assertions (
                 assertion_id TEXT PRIMARY KEY,
@@ -636,8 +713,10 @@ class Stage4Database(Database):
                 assertion_key TEXT NOT NULL,
                 fact_key TEXT NOT NULL,
                 subject_entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+                subject_detection_tier INTEGER,
                 predicate_id TEXT NOT NULL REFERENCES predicates(predicate_id),
                 object_entity_id TEXT REFERENCES entities(entity_id),
+                object_detection_tier INTEGER,
                 object_value_type TEXT,
                 object_value TEXT,
                 object_signature TEXT NOT NULL,
@@ -648,6 +727,7 @@ class Stage4Database(Database):
                 asserted_role TEXT NOT NULL,
                 asserted_at_utc TEXT,
                 confidence_extraction REAL NOT NULL,
+                confidence_grounding REAL NOT NULL,
                 confidence_final REAL NOT NULL,
                 has_user_corroboration INTEGER NOT NULL DEFAULT 0,
                 superseded_by_assertion_id TEXT REFERENCES assertions(assertion_id),
@@ -783,6 +863,13 @@ class Stage4Database(Database):
             (name,)
         )
 
+    def get_entities_by_canonical_name(self, name: str) -> List[sqlite3.Row]:
+        """Get all entities matching canonical name (case-insensitive)."""
+        return self.fetchall(
+            "SELECT * FROM entities WHERE LOWER(canonical_name) = LOWER(?) AND status = 'active'",
+            (name,)
+        )
+
     def get_entity_by_key(self, entity_type: str, entity_key: str) -> Optional[sqlite3.Row]:
         """Get entity by type and key."""
         return self.fetchone(
@@ -793,6 +880,14 @@ class Stage4Database(Database):
     def get_all_active_entities(self) -> List[sqlite3.Row]:
         """Get all active entities."""
         return self.fetchall("SELECT * FROM entities WHERE status = 'active'")
+
+    def get_all_active_entities_with_salience(self) -> List[sqlite3.Row]:
+        """Get all active entities ordered by salience."""
+        return self.fetchall("""
+            SELECT * FROM entities 
+            WHERE status = 'active' 
+            ORDER BY salience_score DESC NULLS LAST, entity_id ASC
+        """)
 
     def search_entity_by_alias(self, alias: str) -> Optional[sqlite3.Row]:
         """Search for entity by alias in aliases_json."""
@@ -814,6 +909,26 @@ class Stage4Database(Database):
                     pass
         return None
 
+    def search_entities_by_alias(self, alias: str) -> List[sqlite3.Row]:
+        """Search for all entities matching alias."""
+        rows = self.fetchall("""
+            SELECT * FROM entities 
+            WHERE status = 'active' 
+              AND aliases_json LIKE ?
+        """, (f'%"{alias}"%',))
+
+        # Verify exact match in JSON
+        result = []
+        for row in rows:
+            if row['aliases_json']:
+                try:
+                    aliases = json.loads(row['aliases_json'])
+                    if alias in aliases:
+                        result.append(row)
+                except json.JSONDecodeError:
+                    pass
+        return result
+
     def create_entity(self, entity_id: str, entity_type: str, entity_key: str,
                       canonical_name: str) -> None:
         """Create a new entity."""
@@ -826,6 +941,16 @@ class Stage4Database(Database):
         """, (entity_id, entity_type, entity_key, canonical_name,
               JCS.canonicalize([canonical_name]), now, now))
 
+    def get_entity_mentions_for_message(self, message_id: str) -> List[sqlite3.Row]:
+        """Get entity mentions for a specific message with detector info."""
+        return self.fetchall("""
+            SELECT em.*, e.canonical_name, e.entity_type
+            FROM entity_mentions em
+            JOIN entities e ON em.entity_id = e.entity_id
+            WHERE em.message_id = ?
+            ORDER BY em.char_start ASC
+        """, (message_id,))
+
     def get_entity_mentions_for_context(self, message_ids: List[str]) -> List[sqlite3.Row]:
         """Get entity mentions for a set of messages."""
         if not message_ids:
@@ -837,6 +962,13 @@ class Stage4Database(Database):
             JOIN entities e ON em.entity_id = e.entity_id
             WHERE em.message_id IN ({placeholders})
         """, tuple(message_ids))
+
+    def get_entity_mentions_by_entity_id(self, entity_id: str) -> List[sqlite3.Row]:
+        """Get all mentions for an entity to compute best detector tier."""
+        return self.fetchall("""
+            SELECT * FROM entity_mentions
+            WHERE entity_id = ?
+        """, (entity_id,))
 
     # --- Time mention operations ---
 
@@ -929,34 +1061,40 @@ class Stage4Database(Database):
         self.execute("""
             INSERT INTO assertions (
                 assertion_id, message_id, assertion_key, fact_key,
-                subject_entity_id, predicate_id, object_entity_id,
+                subject_entity_id, subject_detection_tier, predicate_id, 
+                object_entity_id, object_detection_tier,
                 object_value_type, object_value, object_signature,
                 temporal_qualifier_type, temporal_qualifier_id,
                 modality, polarity, asserted_role, asserted_at_utc,
-                confidence_extraction, confidence_final, has_user_corroboration,
+                confidence_extraction, confidence_grounding, confidence_final, 
+                has_user_corroboration,
                 superseded_by_assertion_id, supersession_type,
                 char_start, char_end, surface_text,
                 extraction_method, extraction_model, raw_assertion_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             assertion.assertion_id, assertion.message_id, assertion.assertion_key,
-            assertion.fact_key, assertion.subject_entity_id, assertion.predicate_id,
-            assertion.object_entity_id, assertion.object_value_type, assertion.object_value,
+            assertion.fact_key, assertion.subject_entity_id, assertion.subject_detection_tier,
+            assertion.predicate_id,
+            assertion.object_entity_id, assertion.object_detection_tier,
+            assertion.object_value_type, assertion.object_value,
             assertion.object_signature, assertion.temporal_qualifier_type,
             assertion.temporal_qualifier_id, assertion.modality, assertion.polarity,
             assertion.asserted_role, assertion.asserted_at_utc,
-            assertion.confidence_extraction, assertion.confidence_final,
+            assertion.confidence_extraction, assertion.confidence_grounding,
+            assertion.confidence_final,
             assertion.has_user_corroboration, assertion.superseded_by_assertion_id,
             assertion.supersession_type, assertion.char_start, assertion.char_end,
             assertion.surface_text, assertion.extraction_method, assertion.extraction_model,
             assertion.raw_assertion_json
         ))
 
-    def update_assertion_confidence(self, assertion_id: str, confidence_final: float) -> None:
+    def update_assertion_confidence(self, assertion_id: str, confidence_final: float,
+                                    confidence_grounding: float) -> None:
         """Update assertion confidence."""
         self.execute(
-            "UPDATE assertions SET confidence_final = ? WHERE assertion_id = ?",
-            (confidence_final, assertion_id)
+            "UPDATE assertions SET confidence_final = ?, confidence_grounding = ? WHERE assertion_id = ?",
+            (confidence_final, confidence_grounding, assertion_id)
         )
 
     def update_assertion_supersession(self, assertion_id: str, superseded_by: str,
@@ -998,6 +1136,38 @@ class Stage4Database(Database):
                 WHERE assertions.predicate_id = predicates.predicate_id
             )
         """)
+
+    def get_assertion_stats_by_detection_tier(self) -> Dict[str, Dict[int, int]]:
+        """Get assertion counts by detection tier for grounding quality stats."""
+        subject_stats = {}
+        object_stats = {}
+
+        # Subject tier stats
+        rows = self.fetchall("""
+            SELECT subject_detection_tier, COUNT(*) as cnt
+            FROM assertions
+            WHERE subject_detection_tier IS NOT NULL
+            GROUP BY subject_detection_tier
+        """)
+        for row in rows:
+            subject_stats[row['subject_detection_tier']] = row['cnt']
+
+        # Object tier stats
+        rows = self.fetchall("""
+            SELECT object_detection_tier, COUNT(*) as cnt
+            FROM assertions
+            WHERE object_detection_tier IS NOT NULL
+            GROUP BY object_detection_tier
+        """)
+        for row in rows:
+            object_stats[row['object_detection_tier']] = row['cnt']
+
+        return {"subject": subject_stats, "object": object_stats}
+
+    def get_average_confidence_grounding(self) -> float:
+        """Get average grounding confidence."""
+        row = self.fetchone("SELECT AVG(confidence_grounding) as avg_conf FROM assertions")
+        return row['avg_conf'] if row and row['avg_conf'] else 0.0
 
     # --- LLM run operations ---
 
@@ -1482,6 +1652,56 @@ class RetractionPatternRegistry:
 
 
 # =============================================================================
+# DETECTOR TIER UTILITIES
+# =============================================================================
+
+class DetectorTierUtils:
+    """Utilities for working with detector tiers."""
+
+    # Mapping of detector names to tiers
+    DETECTOR_TIER_MAP: Dict[str, int] = {
+        # Tier 1 - Highest reliability
+        "user_confirmed": 1,
+        "exact_match": 1,
+        "manual": 1,
+        # Tier 2 - High reliability
+        "ner_high": 2,
+        "spacy_ner": 2,
+        "flair_ner": 2,
+        "transformer_ner": 2,
+        # Tier 3 - Medium reliability
+        "pattern_based": 3,
+        "rule_based": 3,
+        "regex": 3,
+        "heuristic": 3,
+        # Tier 4 - Low reliability (fallback)
+        "fuzzy": 4,
+        "fallback": 4,
+        "unknown": 4,
+    }
+
+    @classmethod
+    def get_tier(cls, detector: str) -> int:
+        """Get detector tier from detector name."""
+        if not detector:
+            return DetectorTier.TIER_4
+        detector_lower = detector.lower()
+        return cls.DETECTOR_TIER_MAP.get(detector_lower, DetectorTier.TIER_4)
+
+    @classmethod
+    def get_tier_label(cls, tier: int) -> str:
+        """Get human-readable tier label."""
+        if tier == 1:
+            return "high"
+        elif tier == 2:
+            return "high"
+        elif tier == 3:
+            return "medium"
+        else:
+            return "low"
+
+
+# =============================================================================
 # MAIN PIPELINE
 # =============================================================================
 
@@ -1490,7 +1710,8 @@ class AssertionExtractionAndGroundingPipeline:
     Stage 4: Assertion Extraction & Grounding Layer
 
     Processes messages from prior stages to extract semantic assertions
-    with entity/predicate grounding and role-aware trust scoring.
+    with entity/predicate grounding, detector-aware reliability scoring,
+    and role-aware trust scoring.
     """
 
     def __init__(self, config: Stage4Config):
@@ -1507,9 +1728,18 @@ class AssertionExtractionAndGroundingPipeline:
         self.llm_run_id: Optional[str] = None
         self.llm_call_count = 0
 
-        # Caches
-        self._entity_cache: Dict[str, sqlite3.Row] = {}
+        # Entity index caches (populated in Phase 1)
+        self._entity_by_id: Dict[str, EntityRecord] = {}
+        self._entity_by_key: Dict[Tuple[str, str], str] = {}
+        self._entity_by_canonical_name: Dict[str, List[str]] = {}
+        self._entity_by_alias: Dict[str, List[str]] = {}
+        self._entities_by_salience: List[str] = []
+        self._max_corpus_salience: float = 1.0
+
+        # Predicate cache
         self._predicate_cache: Dict[str, str] = {}  # label_norm -> predicate_id
+
+        # SELF entity
         self._self_entity_id: Optional[str] = None
 
         # Stats
@@ -1523,7 +1753,9 @@ class AssertionExtractionAndGroundingPipeline:
             "retractions_linked": 0,
             "candidates_extracted": 0,
             "candidates_validated": 0,
-            "candidates_invalid": 0
+            "candidates_invalid": 0,
+            "temporal_bounds_violations": 0,
+            "ambiguous_entity_resolutions": 0,
         }
 
     def run(self) -> Dict[str, int]:
@@ -1565,6 +1797,9 @@ class AssertionExtractionAndGroundingPipeline:
             self.db.commit()
             logger.info("Stage 4 completed successfully")
 
+            # Log grounding quality stats
+            self._log_grounding_quality_stats()
+
         except Exception as e:
             logger.error(f"Stage 4 failed: {e}")
             self.db.rollback()
@@ -1574,6 +1809,20 @@ class AssertionExtractionAndGroundingPipeline:
             self.db.close()
 
         return self.stats
+
+    def _log_grounding_quality_stats(self):
+        """Log grounding quality statistics."""
+        tier_stats = self.db.get_assertion_stats_by_detection_tier()
+        avg_grounding = self.db.get_average_confidence_grounding()
+
+        logger.info("=" * 60)
+        logger.info("Grounding Quality Stats:")
+        logger.info(f"  Subject tier distribution: {tier_stats.get('subject', {})}")
+        logger.info(f"  Object tier distribution: {tier_stats.get('object', {})}")
+        logger.info(f"  Average confidence_grounding: {avg_grounding:.4f}")
+        logger.info(f"  Temporal bounds violations: {self.stats['temporal_bounds_violations']}")
+        logger.info(f"  Ambiguous entity resolutions: {self.stats['ambiguous_entity_resolutions']}")
+        logger.info("=" * 60)
 
     # =========================================================================
     # Phase 1: Initialize + Prepare
@@ -1587,6 +1836,9 @@ class AssertionExtractionAndGroundingPipeline:
         self._self_entity_id = self.db.get_self_entity_id()
         if not self._self_entity_id:
             logger.warning("SELF entity not found - will create during grounding if needed")
+
+        # Build entity resolution index
+        self._build_entity_index()
 
         # Initialize LLM run if enabled
         if self.config.enable_llm_assertion_extraction:
@@ -1612,6 +1864,89 @@ class AssertionExtractionAndGroundingPipeline:
                 self.stage_started_at_utc
             )
             logger.info(f"Created LLM extraction run: {self.llm_run_id}")
+
+    def _build_entity_index(self):
+        """Build in-memory entity indices for efficient lookup during grounding."""
+        logger.info("Building entity resolution index...")
+
+        # Get all active entities ordered by salience
+        entities = self.db.get_all_active_entities_with_salience()
+
+        for entity_row in entities:
+            entity_id = entity_row['entity_id']
+            entity_type = entity_row['entity_type']
+            entity_key = entity_row['entity_key']
+            canonical_name = entity_row['canonical_name']
+            salience_score = row_get(entity_row, 'salience_score')
+
+            # Parse aliases
+            aliases = []
+            if entity_row['aliases_json']:
+                try:
+                    aliases = json.loads(entity_row['aliases_json'])
+                except json.JSONDecodeError:
+                    pass
+
+            # Compute best detector tier from mentions
+            best_detector_tier = self._compute_best_detector_tier(entity_id)
+
+            # Create EntityRecord
+            record = EntityRecord(
+                entity_id=entity_id,
+                entity_type=entity_type,
+                entity_key=entity_key,
+                canonical_name=canonical_name,
+                aliases=aliases,
+                salience_score=salience_score,
+                mention_count=row_get(entity_row, 'mention_count', 0),
+                conversation_count=row_get(entity_row, 'conversation_count', 0),
+                first_seen_at_utc=row_get(entity_row, 'first_seen_at_utc'),
+                last_seen_at_utc=row_get(entity_row, 'last_seen_at_utc'),
+                best_detector_tier=best_detector_tier
+            )
+
+            # Index by ID
+            self._entity_by_id[entity_id] = record
+
+            # Index by (type, key)
+            self._entity_by_key[(entity_type, entity_key)] = entity_id
+
+            # Index by canonical name (case-insensitive)
+            name_lower = canonical_name.lower()
+            if name_lower not in self._entity_by_canonical_name:
+                self._entity_by_canonical_name[name_lower] = []
+            self._entity_by_canonical_name[name_lower].append(entity_id)
+
+            # Index by aliases (case-insensitive)
+            for alias in aliases:
+                alias_lower = alias.lower()
+                if alias_lower not in self._entity_by_alias:
+                    self._entity_by_alias[alias_lower] = []
+                self._entity_by_alias[alias_lower].append(entity_id)
+
+            # Track max salience
+            if salience_score is not None and salience_score > self._max_corpus_salience:
+                self._max_corpus_salience = salience_score
+
+            # Add to salience-ordered list
+            self._entities_by_salience.append(entity_id)
+
+        logger.info(f"Built entity index with {len(self._entity_by_id)} entities")
+
+    def _compute_best_detector_tier(self, entity_id: str) -> int:
+        """Compute best (lowest) detector tier from entity mentions."""
+        mentions = self.db.get_entity_mentions_by_entity_id(entity_id)
+        if not mentions:
+            return DetectorTier.TIER_4
+
+        best_tier = DetectorTier.TIER_4
+        for mention in mentions:
+            detector = row_get(mention, 'detector', 'unknown')
+            tier = DetectorTierUtils.get_tier(detector)
+            if tier < best_tier:
+                best_tier = tier
+
+        return best_tier
 
     # =========================================================================
     # Phase 2-5: Per-Message Processing
@@ -1750,16 +2085,21 @@ class AssertionExtractionAndGroundingPipeline:
         # Collect message IDs for entity/time lookup
         all_message_ids = [message_id] + [m['message_id'] for m in context_messages]
 
-        # Get context entities
+        # Get context entities with salience and reliability info
         entity_mentions = self.db.get_entity_mentions_for_context(all_message_ids)
         context_entities = {}
         for em in entity_mentions:
             eid = em['entity_id']
             if eid not in context_entities:
+                entity_record = self._entity_by_id.get(eid)
                 context_entities[eid] = {
                     "entity_id": eid,
                     "canonical_name": em['canonical_name'],
                     "entity_type": em['entity_type'],
+                    "salience": entity_record.salience_score if entity_record else None,
+                    "reliability": DetectorTierUtils.get_tier_label(
+                        entity_record.best_detector_tier if entity_record else 4
+                    ),
                     "mentions": []
                 }
             context_entities[eid]["mentions"].append({
@@ -1781,6 +2121,9 @@ class AssertionExtractionAndGroundingPipeline:
             for t in time_rows
         ]
 
+        # Build entity mention map for target message (for span-based resolution)
+        entity_mention_map = self._build_entity_mention_map(message_id)
+
         return MessageContext(
             message_id=message_id,
             conversation_id=conversation_id,
@@ -1791,8 +2134,27 @@ class AssertionExtractionAndGroundingPipeline:
             exclusion_ranges=exclusions,
             context_messages=context_messages,
             context_entities=context_entities,
-            context_times=context_times
+            context_times=context_times,
+            entity_mention_map=entity_mention_map
         )
+
+    def _build_entity_mention_map(self, message_id: str) -> List[EntityMentionInfo]:
+        """Build entity mention map for span-based resolution."""
+        mentions = self.db.get_entity_mentions_for_message(message_id)
+        result = []
+        for m in mentions:
+            detector = row_get(m, 'detector', 'unknown')
+            detector_tier = DetectorTierUtils.get_tier(detector)
+            result.append(EntityMentionInfo(
+                entity_id=m['entity_id'],
+                char_start=row_get(m, 'char_start', 0),
+                char_end=row_get(m, 'char_end', 0),
+                detector=detector,
+                detector_tier=detector_tier,
+                confidence=row_get(m, 'confidence', 0.5),
+                surface_text=row_get(m, 'surface_text', '')
+            ))
+        return result
 
     # =========================================================================
     # Phase 2: Candidate Extraction
@@ -1816,7 +2178,7 @@ class AssertionExtractionAndGroundingPipeline:
         """Extract candidates using LLM."""
         # Placeholder for LLM extraction
         # In a real implementation, this would:
-        # 1. Build prompt with context
+        # 1. Build prompt with context (including salience and reliability hints)
         # 2. Call LLM API with determinism settings
         # 3. Parse response into candidates
         # 4. Log call in llm_extraction_calls
@@ -1938,9 +2300,9 @@ class AssertionExtractionAndGroundingPipeline:
             candidate.char_end = matches[0] + len(quote)
             logger.debug(f"Resolved quote to offset [{candidate.char_start}, {candidate.char_end})")
         elif len(matches) == 0:
-            logger.debug(f"Quote not found in text: {quote[:50]}...")
+            logger.warning(f"QUOTE_OFFSET_UNRESOLVED: Quote not found in text: {quote[:50]}...")
         else:
-            logger.debug(f"Quote is ambiguous ({len(matches)} matches): {quote[:50]}...")
+            logger.warning(f"QUOTE_OFFSET_UNRESOLVED: Quote is ambiguous ({len(matches)} matches): {quote[:50]}...")
 
     # =========================================================================
     # Phase 4: Grounding
@@ -1966,27 +2328,38 @@ class AssertionExtractionAndGroundingPipeline:
                           context: MessageContext) -> Optional[GroundedAssertion]:
         """Ground a single candidate."""
 
-        # Resolve subject
-        subject_entity_id = self._resolve_entity(candidate.subject, context)
-        if not subject_entity_id:
+        # Resolve subject (returns tuple: entity_id, detection_tier, resolution_confidence)
+        subject_result = self._resolve_entity(candidate.subject, context, candidate.char_start, candidate.char_end)
+        if not subject_result:
             logger.warning(f"Could not resolve subject: {candidate.subject}")
             return None
+
+        subject_entity_id = subject_result.entity_id
+        subject_detection_tier = subject_result.detection_tier
+        subject_resolution_confidence = subject_result.resolution_confidence
 
         # Resolve predicate
         predicate_id = self._resolve_predicate(candidate.predicate_label, context)
 
         # Resolve object
         object_entity_id = None
+        object_detection_tier = None
         object_value_type = None
         object_value = None
+        object_resolution_confidence = 1.0
 
         if candidate.object_entity_ref:
-            object_entity_id = self._resolve_entity(candidate.object_entity_ref, context)
-            if not object_entity_id:
+            object_result = self._resolve_entity(candidate.object_entity_ref, context, None, None)
+            if object_result:
+                object_entity_id = object_result.entity_id
+                object_detection_tier = object_result.detection_tier
+                object_resolution_confidence = object_result.resolution_confidence
+            else:
                 logger.warning(f"Could not resolve object entity: {candidate.object_entity_ref}")
                 # Fall back to literal
                 object_value_type = "string"
                 object_value = JCS.canonicalize(candidate.object_entity_ref)
+                object_resolution_confidence = 0.5
 
         elif candidate.object_literal_type and candidate.object_literal_value is not None:
             object_value_type = candidate.object_literal_type
@@ -2000,9 +2373,6 @@ class AssertionExtractionAndGroundingPipeline:
             object_entity_id, object_value_type, object_value
         )
 
-        # Determine arity and update predicate if needed
-        arity = 1 if object_signature == "N:__NONE__" else 2
-
         # Resolve temporal qualifier
         temporal_qualifier_type = None
         temporal_qualifier_id = None
@@ -2014,6 +2384,13 @@ class AssertionExtractionAndGroundingPipeline:
             if tm:
                 temporal_qualifier_id = tm['time_mention_id']
                 temporal_qualifier_type = candidate.temporal_qualifier_type or "at"
+            else:
+                logger.info(f"TEMPORAL_QUALIFIER_UNLINKED: {candidate.temporal_qualifier_surface}")
+
+        # Temporal bounds validation
+        temporal_bounds_check = self._validate_temporal_bounds(
+            subject_entity_id, object_entity_id, temporal_qualifier_id, context
+        )
 
         # Compute keys
         assertion_key = self._compute_assertion_key(
@@ -2028,14 +2405,28 @@ class AssertionExtractionAndGroundingPipeline:
 
         # Check corroboration (for assistant assertions)
         has_user_corroboration = 0
+        corroboration_details = {}
         if context.role == "assistant":
-            has_user_corroboration = self._check_corroboration(
+            has_user_corroboration, corroboration_details = self._check_corroboration(
                 context, subject_entity_id, predicate_id, object_signature
             )
 
-        # Compute confidence
+        # Compute confidence (enhanced with detector awareness)
+        confidence_grounding = self._compute_grounding_confidence(
+            subject_resolution_confidence, subject_detection_tier,
+            object_resolution_confidence, object_detection_tier
+        )
+
         trust_weight = self._get_trust_weight(context.role, has_user_corroboration)
-        confidence_final = min(1.0, max(0.0, candidate.confidence * trust_weight))
+
+        salience_factor = self._compute_salience_factor(subject_entity_id)
+
+        temporal_factor = 1.0 - temporal_bounds_check.penalty_applied
+
+        confidence_final = self._clamp(
+            candidate.confidence * confidence_grounding * trust_weight * salience_factor * temporal_factor,
+            0.0, 1.0
+        )
 
         # Build surface text
         surface_text = None
@@ -2050,8 +2441,20 @@ class AssertionExtractionAndGroundingPipeline:
             "object_literal_type": candidate.object_literal_type,
             "object_literal_value": candidate.object_literal_value,
             "extraction_method": candidate.extraction_method,
-            "pattern_data": candidate.raw_data
+            "pattern_data": candidate.raw_data,
+            "grounding_details": {
+                "subject_resolution_confidence": subject_resolution_confidence,
+                "object_resolution_confidence": object_resolution_confidence,
+                "temporal_bounds_check": {
+                    "subject_bounds_valid": temporal_bounds_check.subject_bounds_valid,
+                    "object_bounds_valid": temporal_bounds_check.object_bounds_valid,
+                    "penalty_applied": temporal_bounds_check.penalty_applied
+                }
+            }
         }
+        if corroboration_details:
+            raw_data["corroboration"] = corroboration_details
+
         raw_assertion_json = JCS.canonicalize(raw_data)
 
         # Generate assertion ID
@@ -2067,8 +2470,10 @@ class AssertionExtractionAndGroundingPipeline:
             assertion_key=assertion_key,
             fact_key=fact_key,
             subject_entity_id=subject_entity_id,
+            subject_detection_tier=subject_detection_tier,
             predicate_id=predicate_id,
             object_entity_id=object_entity_id,
+            object_detection_tier=object_detection_tier,
             object_value_type=object_value_type,
             object_value=object_value,
             object_signature=object_signature,
@@ -2079,6 +2484,7 @@ class AssertionExtractionAndGroundingPipeline:
             asserted_role=context.role,
             asserted_at_utc=context.created_at_utc,
             confidence_extraction=candidate.confidence,
+            confidence_grounding=confidence_grounding,
             confidence_final=confidence_final,
             has_user_corroboration=has_user_corroboration,
             superseded_by_assertion_id=None,
@@ -2091,98 +2497,182 @@ class AssertionExtractionAndGroundingPipeline:
             raw_assertion_json=raw_assertion_json
         )
 
-    def _resolve_entity(self, reference: str, context: MessageContext) -> Optional[str]:
-        """Resolve entity reference to entity_id."""
+    def _resolve_entity(self, reference: str, context: MessageContext,
+                        char_start: Optional[int] = None,
+                        char_end: Optional[int] = None) -> Optional[EntityResolutionResult]:
+        """Resolve entity reference to entity_id with detection tier and confidence."""
         reference = reference.strip()
 
         # 1. Reserved SELF reference
         self_refs = {"SELF", "self", "I", "i", "me", "my", "Me", "My"}
         if reference in self_refs:
             if self._self_entity_id:
-                return self._self_entity_id
+                return EntityResolutionResult(self._self_entity_id, DetectorTier.TIER_1, 1.0)
             else:
                 # Create SELF entity
-                return self._create_self_entity()
+                entity_id = self._create_self_entity()
+                return EntityResolutionResult(entity_id, DetectorTier.TIER_1, 1.0)
 
-        # 2. Check cache
-        cache_key = reference.lower()
-        if cache_key in self._entity_cache:
-            return self._entity_cache[cache_key]['entity_id']
-
-        # 3. Direct UUID check
+        # 2. Direct entity_id (UUID check)
         try:
             uuid.UUID(reference)
-            entity = self.db.get_entity_by_id(reference)
-            if entity:
-                self._entity_cache[cache_key] = entity
-                return entity['entity_id']
+            if reference in self._entity_by_id:
+                record = self._entity_by_id[reference]
+                return EntityResolutionResult(
+                    reference, record.best_detector_tier, 1.0
+                )
         except ValueError:
             pass
 
+        # 3. Span-based resolution (preferred for assertions with offsets)
+        if char_start is not None and char_end is not None:
+            span_result = self._resolve_by_span(context, char_start, char_end)
+            if span_result:
+                return span_result
+
         # 4. Canonical name match (case-insensitive)
-        entity = self.db.get_entity_by_canonical_name(reference)
-        if entity:
-            self._entity_cache[cache_key] = entity
-            return entity['entity_id']
+        ref_lower = reference.lower()
+        if ref_lower in self._entity_by_canonical_name:
+            entity_ids = self._entity_by_canonical_name[ref_lower]
+            if len(entity_ids) == 1:
+                record = self._entity_by_id[entity_ids[0]]
+                return EntityResolutionResult(
+                    entity_ids[0], record.best_detector_tier, 0.95
+                )
+            elif len(entity_ids) > 1:
+                # Ambiguous - select by tier, salience, then ID
+                self.stats["ambiguous_entity_resolutions"] += 1
+                selected = self._select_best_entity(entity_ids)
+                record = self._entity_by_id[selected]
+                return EntityResolutionResult(
+                    selected, record.best_detector_tier, 0.8  # Lower confidence due to ambiguity
+                )
 
         # 5. Alias match
-        entity = self.db.search_entity_by_alias(reference)
-        if entity:
-            self._entity_cache[cache_key] = entity
-            return entity['entity_id']
+        if ref_lower in self._entity_by_alias:
+            entity_ids = self._entity_by_alias[ref_lower]
+            if len(entity_ids) == 1:
+                record = self._entity_by_id[entity_ids[0]]
+                return EntityResolutionResult(
+                    entity_ids[0], record.best_detector_tier, 0.9
+                )
+            elif len(entity_ids) > 1:
+                self.stats["ambiguous_entity_resolutions"] += 1
+                selected = self._select_best_entity(entity_ids)
+                record = self._entity_by_id[selected]
+                return EntityResolutionResult(
+                    selected, record.best_detector_tier, 0.75
+                )
 
-        # 6. Context entities check
-        for eid, edata in context.context_entities.items():
-            if edata['canonical_name'].lower() == reference.lower():
-                return eid
-            # Check mention surfaces
-            for m in edata.get('mentions', []):
-                if m.get('surface_text', '').lower() == reference.lower():
-                    return eid
+        # 6. Entity key match
+        normalized_key = TextUtils.nfkc_normalize(reference.strip().lower())
+        normalized_key = TextUtils.normalize_whitespace(normalized_key)
+        # Try common entity types
+        for entity_type in ["PERSON", "ORGANIZATION", "LOCATION", "OTHER"]:
+            key = (entity_type, normalized_key)
+            if key in self._entity_by_key:
+                entity_id = self._entity_by_key[key]
+                record = self._entity_by_id[entity_id]
+                return EntityResolutionResult(
+                    entity_id, record.best_detector_tier, 0.9
+                )
 
         # 7. Fuzzy match (if enabled)
         if self.config.enable_fuzzy_entity_linking:
-            best_match = None
-            best_score = 0.0
-
-            all_entities = self.db.get_all_active_entities()
-            for entity in all_entities:
-                # Check canonical name
-                score = TextUtils.jaro_winkler_similarity(
-                    reference.lower(),
-                    entity['canonical_name'].lower()
-                )
-                if score > best_score:
-                    best_score = score
-                    best_match = entity
-
-                # Check aliases
-                if entity['aliases_json']:
-                    try:
-                        aliases = json.loads(entity['aliases_json'])
-                        for alias in aliases:
-                            score = TextUtils.jaro_winkler_similarity(
-                                reference.lower(),
-                                alias.lower()
-                            )
-                            if score > best_score:
-                                best_score = score
-                                best_match = entity
-                    except json.JSONDecodeError:
-                        pass
-
-            if best_match and best_score >= self.config.threshold_link_string_sim:
-                self._entity_cache[cache_key] = best_match
-                return best_match['entity_id']
+            fuzzy_result = self._resolve_by_fuzzy_match(reference)
+            if fuzzy_result:
+                return fuzzy_result
 
         # 8. Create new entity (fallback)
-        return self._create_entity_fallback(reference)
+        entity_id = self._create_entity_fallback(reference)
+        return EntityResolutionResult(entity_id, DetectorTier.TIER_4, 0.5)
+
+    def _resolve_by_span(self, context: MessageContext,
+                         char_start: int, char_end: int) -> Optional[EntityResolutionResult]:
+        """Resolve entity by overlapping span in entity mention map."""
+        overlapping = []
+        for mention in context.entity_mention_map:
+            # Check for overlap
+            if char_start < mention.char_end and char_end > mention.char_start:
+                overlapping.append(mention)
+
+        if len(overlapping) == 1:
+            m = overlapping[0]
+            return EntityResolutionResult(m.entity_id, m.detector_tier, m.confidence)
+        elif len(overlapping) > 1:
+            # Select by (detector_tier ASC, confidence DESC, entity_id ASC)
+            overlapping.sort(key=lambda m: (m.detector_tier, -m.confidence, m.entity_id))
+            m = overlapping[0]
+            return EntityResolutionResult(m.entity_id, m.detector_tier, m.confidence)
+
+        return None
+
+    def _resolve_by_fuzzy_match(self, reference: str) -> Optional[EntityResolutionResult]:
+        """Resolve entity by fuzzy matching."""
+        ref_lower = reference.lower()
+        best_match_id = None
+        best_score = 0.0
+        best_tier = DetectorTier.TIER_4
+
+        for entity_id in self._entities_by_salience:
+            record = self._entity_by_id[entity_id]
+
+            # Check canonical name
+            score = TextUtils.jaro_winkler_similarity(ref_lower, record.canonical_name.lower())
+            if score > best_score:
+                best_score = score
+                best_match_id = entity_id
+                best_tier = record.best_detector_tier
+
+            # Check aliases
+            for alias in record.aliases:
+                score = TextUtils.jaro_winkler_similarity(ref_lower, alias.lower())
+                if score > best_score:
+                    best_score = score
+                    best_match_id = entity_id
+                    best_tier = record.best_detector_tier
+
+        if best_match_id and best_score >= self.config.threshold_link_string_sim:
+            confidence = best_score * 0.8
+            return EntityResolutionResult(best_match_id, best_tier, confidence)
+
+        return None
+
+    def _select_best_entity(self, entity_ids: List[str]) -> str:
+        """Select best entity from multiple candidates using tie-breaking rules."""
+        # Sort by (best_detector_tier ASC, salience_score DESC NULLS LAST, entity_id ASC)
+        def sort_key(eid: str) -> Tuple:
+            record = self._entity_by_id.get(eid)
+            if record:
+                salience = record.salience_score if record.salience_score is not None else -float('inf')
+                return (record.best_detector_tier, -salience, eid)
+            return (DetectorTier.TIER_4, -float('inf'), eid)
+
+        sorted_ids = sorted(entity_ids, key=sort_key)
+        return sorted_ids[0]
 
     def _create_self_entity(self) -> str:
         """Create the SELF entity."""
         entity_id = self.id_generator.generate(["entity", "PERSON", "__SELF__"])
         self.db.create_entity(entity_id, "PERSON", "__SELF__", "SELF")
         self._self_entity_id = entity_id
+
+        # Add to index
+        record = EntityRecord(
+            entity_id=entity_id,
+            entity_type="PERSON",
+            entity_key="__SELF__",
+            canonical_name="SELF",
+            aliases=["SELF"],
+            salience_score=None,
+            mention_count=0,
+            conversation_count=0,
+            first_seen_at_utc=TimestampUtils.now_utc(),
+            last_seen_at_utc=TimestampUtils.now_utc(),
+            best_detector_tier=DetectorTier.TIER_1
+        )
+        self._entity_by_id[entity_id] = record
+
         self.stats["entities_created"] += 1
         logger.info(f"Created SELF entity: {entity_id}")
         return entity_id
@@ -2201,8 +2691,30 @@ class AssertionExtractionAndGroundingPipeline:
             return existing['entity_id']
 
         self.db.create_entity(entity_id, "OTHER", entity_key, reference)
+
+        # Add to index
+        record = EntityRecord(
+            entity_id=entity_id,
+            entity_type="OTHER",
+            entity_key=entity_key,
+            canonical_name=reference,
+            aliases=[reference],
+            salience_score=None,
+            mention_count=0,
+            conversation_count=0,
+            first_seen_at_utc=TimestampUtils.now_utc(),
+            last_seen_at_utc=TimestampUtils.now_utc(),
+            best_detector_tier=DetectorTier.TIER_4
+        )
+        self._entity_by_id[entity_id] = record
+        self._entity_by_key[("OTHER", entity_key)] = entity_id
+        name_lower = reference.lower()
+        if name_lower not in self._entity_by_canonical_name:
+            self._entity_by_canonical_name[name_lower] = []
+        self._entity_by_canonical_name[name_lower].append(entity_id)
+
         self.stats["entities_created"] += 1
-        logger.warning(f"Created entity during grounding: {reference} -> {entity_id}")
+        logger.warning(f"ENTITY_CREATED_DURING_GROUNDING: {reference} -> {entity_id}")
 
         return entity_id
 
@@ -2302,15 +2814,59 @@ class AssertionExtractionAndGroundingPipeline:
             object_signature
         ])
 
+    def _validate_temporal_bounds(self, subject_entity_id: str,
+                                  object_entity_id: Optional[str],
+                                  temporal_qualifier_id: Optional[str],
+                                  context: MessageContext) -> TemporalBoundsCheck:
+        """Validate assertion against entity temporal bounds."""
+        if not self.config.enable_temporal_bounds_validation:
+            return TemporalBoundsCheck(True, True, 0.0)
+
+        subject_valid = True
+        object_valid = True
+        penalty = 0.0
+
+        # Get temporal qualifier valid_from if available
+        qualifier_valid_from = None
+        if temporal_qualifier_id:
+            # Would need to look up the time_mention to get valid_from_utc
+            # For now, skip this check if we don't have easy access
+            pass
+
+        # Check subject temporal bounds
+        subject_record = self._entity_by_id.get(subject_entity_id)
+        if subject_record and subject_record.first_seen_at_utc and qualifier_valid_from:
+            if TimestampUtils.compare(qualifier_valid_from, subject_record.first_seen_at_utc) < 0:
+                logger.warning(f"ASSERTION_PRECEDES_ENTITY_FIRST_SEEN: subject {subject_entity_id}")
+                subject_valid = False
+                penalty += self.config.temporal_bounds_violation_penalty
+                self.stats["temporal_bounds_violations"] += 1
+
+        # Check object temporal bounds (if entity object)
+        if object_entity_id:
+            object_record = self._entity_by_id.get(object_entity_id)
+            if object_record and object_record.first_seen_at_utc and qualifier_valid_from:
+                if TimestampUtils.compare(qualifier_valid_from, object_record.first_seen_at_utc) < 0:
+                    logger.warning(f"ASSERTION_PRECEDES_ENTITY_FIRST_SEEN: object {object_entity_id}")
+                    object_valid = False
+                    penalty += self.config.temporal_bounds_violation_penalty
+                    self.stats["temporal_bounds_violations"] += 1
+
+        return TemporalBoundsCheck(subject_valid, object_valid, min(penalty, 1.0))
+
     def _check_corroboration(self, context: MessageContext,
                              subject_entity_id: str, predicate_id: str,
-                             object_signature: str) -> int:
+                             object_signature: str) -> Tuple[int, Dict]:
         """Check if assistant assertion is corroborated by prior user assertion."""
         prior_assertions = self.db.get_prior_user_assertions(
             context.conversation_id,
             context.order_index,
             self.config.coref_window_size
         )
+
+        corroborating_ids = []
+        match_type = None
+        similarity_score = None
 
         for prior in prior_assertions:
             # Same subject
@@ -2320,17 +2876,81 @@ class AssertionExtractionAndGroundingPipeline:
             # Same or similar predicate
             predicate_match = prior['predicate_id'] == predicate_id
             if not predicate_match and self.config.enable_fuzzy_entity_linking:
-                # Fuzzy predicate matching would go here
-                pass
+                # Fuzzy predicate matching
+                prior_pred = self.db.fetchone(
+                    "SELECT canonical_label_norm FROM predicates WHERE predicate_id = ?",
+                    (prior['predicate_id'],)
+                )
+                current_pred = self.db.fetchone(
+                    "SELECT canonical_label_norm FROM predicates WHERE predicate_id = ?",
+                    (predicate_id,)
+                )
+                if prior_pred and current_pred:
+                    sim = TextUtils.jaro_winkler_similarity(
+                        prior_pred['canonical_label_norm'],
+                        current_pred['canonical_label_norm']
+                    )
+                    if sim >= self.config.predicate_similarity_threshold:
+                        predicate_match = True
+                        match_type = "fuzzy_predicate"
+                        similarity_score = sim
 
             if not predicate_match:
                 continue
 
             # Same object
             if prior['object_signature'] == object_signature:
-                return 1
+                corroborating_ids.append(prior['assertion_id'])
+                if not match_type:
+                    match_type = "exact_predicate"
 
-        return 0
+        if corroborating_ids:
+            details = {
+                "corroborating_assertion_ids": corroborating_ids,
+                "match_type": match_type
+            }
+            if similarity_score is not None:
+                details["similarity_score"] = similarity_score
+            return 1, details
+
+        return 0, {}
+
+    def _compute_grounding_confidence(self, subject_resolution_confidence: float,
+                                      subject_detection_tier: int,
+                                      object_resolution_confidence: float,
+                                      object_detection_tier: Optional[int]) -> float:
+        """Compute grounding confidence with detector tier bonuses."""
+        # Detector tier bonus (higher-reliability entities boost confidence)
+        subject_tier_factor = 1.0 + (4 - subject_detection_tier) * self.config.detector_grounding_bonus
+
+        if object_detection_tier is not None:
+            object_tier_factor = 1.0 + (4 - object_detection_tier) * self.config.detector_grounding_bonus
+        else:
+            object_tier_factor = 1.0
+
+        # Compose grounding confidence
+        confidence_grounding = self._clamp(
+            (subject_resolution_confidence * subject_tier_factor +
+             object_resolution_confidence * object_tier_factor) / 2,
+            0.0, 1.0
+        )
+
+        return confidence_grounding
+
+    def _compute_salience_factor(self, subject_entity_id: str) -> float:
+        """Compute salience factor for confidence boost."""
+        if not self.config.enable_salience_confidence_boost:
+            return 1.0
+
+        record = self._entity_by_id.get(subject_entity_id)
+        if not record or record.salience_score is None:
+            return 1.0
+
+        # Normalize salience to [0, 1] range using corpus max
+        normalized_salience = record.salience_score / self._max_corpus_salience
+        salience_factor = 1.0 + normalized_salience * self.config.salience_confidence_bonus
+
+        return salience_factor
 
     def _get_trust_weight(self, role: str, has_corroboration: int) -> float:
         """Get trust weight based on role and corroboration."""
@@ -2340,6 +2960,11 @@ class AssertionExtractionAndGroundingPipeline:
             return self.config.trust_weight_assistant_corroborated
         else:
             return self.config.trust_weight_assistant_uncorroborated
+
+    @staticmethod
+    def _clamp(value: float, min_val: float, max_val: float) -> float:
+        """Clamp value to range."""
+        return max(min_val, min(max_val, value))
 
     # =========================================================================
     # Phase 5: Persistence
@@ -2357,7 +2982,8 @@ class AssertionExtractionAndGroundingPipeline:
                     # Update existing
                     self.db.update_assertion_confidence(
                         existing['assertion_id'],
-                        assertion.confidence_final
+                        assertion.confidence_final,
+                        assertion.confidence_grounding
                     )
                     self.stats["assertions_updated"] += 1
                 # else: keep existing, do nothing
@@ -2551,6 +3177,35 @@ if __name__ == "__main__":
         help="Window size for corroboration detection"
     )
     parser.add_argument(
+        "--detector-grounding-bonus",
+        type=float,
+        default=0.05,
+        help="Per-tier grounding confidence bonus"
+    )
+    parser.add_argument(
+        "--enable-salience-boost",
+        action="store_true",
+        help="Enable salience-based confidence boost"
+    )
+    parser.add_argument(
+        "--salience-bonus",
+        type=float,
+        default=0.1,
+        help="Max salience boost factor"
+    )
+    parser.add_argument(
+        "--enable-temporal-validation",
+        action="store_true",
+        default=True,
+        help="Enable temporal bounds validation"
+    )
+    parser.add_argument(
+        "--temporal-penalty",
+        type=float,
+        default=0.1,
+        help="Confidence penalty for temporal bounds violations"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging"
@@ -2573,7 +3228,12 @@ if __name__ == "__main__":
         ignore_markdown_blockquotes=args.ignore_blockquotes,
         assertion_upsert_policy=args.upsert_policy,
         threshold_link_string_sim=args.fuzzy_threshold,
-        coref_window_size=args.coref_window
+        coref_window_size=args.coref_window,
+        detector_grounding_bonus=args.detector_grounding_bonus,
+        enable_salience_confidence_boost=args.enable_salience_boost,
+        salience_confidence_bonus=args.salience_bonus,
+        enable_temporal_bounds_validation=args.enable_temporal_validation,
+        temporal_bounds_violation_penalty=args.temporal_penalty
     )
 
     try:
@@ -2582,16 +3242,18 @@ if __name__ == "__main__":
         print("\n" + "=" * 60)
         print("Stage 4: Assertion Extraction & Grounding - Complete")
         print("=" * 60)
-        print(f"Messages processed:     {stats['messages_processed']:>8}")
-        print(f"Candidates extracted:   {stats['candidates_extracted']:>8}")
-        print(f"Candidates validated:   {stats['candidates_validated']:>8}")
-        print(f"Candidates invalid:     {stats['candidates_invalid']:>8}")
-        print(f"Assertions inserted:    {stats['assertions_inserted']:>8}")
-        print(f"Assertions updated:     {stats['assertions_updated']:>8}")
-        print(f"Predicates created:     {stats['predicates_created']:>8}")
-        print(f"Entities created:       {stats['entities_created']:>8}")
-        print(f"Retractions detected:   {stats['retractions_detected']:>8}")
-        print(f"Retractions linked:     {stats['retractions_linked']:>8}")
+        print(f"Messages processed:           {stats['messages_processed']:>8}")
+        print(f"Candidates extracted:         {stats['candidates_extracted']:>8}")
+        print(f"Candidates validated:         {stats['candidates_validated']:>8}")
+        print(f"Candidates invalid:           {stats['candidates_invalid']:>8}")
+        print(f"Assertions inserted:          {stats['assertions_inserted']:>8}")
+        print(f"Assertions updated:           {stats['assertions_updated']:>8}")
+        print(f"Predicates created:           {stats['predicates_created']:>8}")
+        print(f"Entities created:             {stats['entities_created']:>8}")
+        print(f"Retractions detected:         {stats['retractions_detected']:>8}")
+        print(f"Retractions linked:           {stats['retractions_linked']:>8}")
+        print(f"Temporal bounds violations:   {stats['temporal_bounds_violations']:>8}")
+        print(f"Ambiguous entity resolutions: {stats['ambiguous_entity_resolutions']:>8}")
         print("=" * 60)
 
     except Exception as e:

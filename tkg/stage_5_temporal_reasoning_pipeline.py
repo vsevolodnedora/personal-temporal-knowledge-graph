@@ -1,5 +1,5 @@
 """
-Stage 4: Temporal Reasoning Layer
+Stage 5: Temporal Reasoning Layer
 
 This module implements the temporal reasoning layer for a personal bitemporal
 knowledge graph. It processes assertions from Stage 4 to:
@@ -293,7 +293,7 @@ class InvalidationPolicy(StrEnum):
 
 
 class TemporalQualifierType(StrEnum):
-    """Temporal qualifier types from Stage 3."""
+    """Temporal qualifier types from Stage 4."""
     AT = "at"
     SINCE = "since"
     UNTIL = "until"
@@ -303,8 +303,8 @@ class TemporalQualifierType(StrEnum):
 # ===| CONFIGURATION |===
 
 @dataclass
-class Stage4Config:
-    """Configuration for Stage 4 pipeline."""
+class Stage5Config:
+    """Configuration for Stage 5 pipeline."""
     output_file_path: Path
     invalidation_rules_path: Optional[Path] = None
     id_namespace: str = "550e8400-e29b-41d4-a716-446655440000"
@@ -319,6 +319,10 @@ class Stage4Config:
     # Threshold parameters
     threshold_close: float = 0.7
     confidence_supersession_margin: float = 0.01
+
+    # Detector tier and salience tie-breaking (§5.0 Configuration parameters)
+    use_detector_tier_tiebreak: bool = True
+    use_salience_conflict_tiebreak: bool = False
 
 
 # ===| DATA CLASSES |===
@@ -348,6 +352,9 @@ class AssertionRecord:
     char_end: Optional[int]
     message_timestamp_quality: str
     fact_key: str
+    # Detection tiers for audit and tie-breaking (§5.4.0, §5.10.3, §5.10.4)
+    subject_detection_tier: Optional[int] = None
+    object_detection_tier: Optional[int] = None
 
 
 @dataclass
@@ -467,15 +474,15 @@ class Database:
         return cursor.fetchall()
 
 
-class Stage4Database(Database):
-    """Stage 4 specific database operations."""
+class Stage5Database(Database):
+    """Stage 5 specific database operations."""
 
     REQUIRED_TABLES = [
         "conversations", "messages", "entities",
         "time_mentions", "assertions", "predicates"
     ]
 
-    STAGE4_TABLES = [
+    STAGE5_TABLES = [
         "assertion_temporalized",
         "invalidation_rules",
         "conflict_groups",
@@ -493,15 +500,15 @@ class Stage4Database(Database):
                 raise RuntimeError(f"Required table '{table}' not found. Run previous stages first.")
         logger.info("All required tables present")
 
-    def drop_stage4_tables(self):
-        """Drop existing Stage 4 tables (for re-run)."""
-        for table in reversed(self.STAGE4_TABLES):
+    def drop_stage5_tables(self):
+        """Drop existing Stage 5 tables (for re-run)."""
+        for table in reversed(self.STAGE5_TABLES):
             self.execute(f"DROP TABLE IF EXISTS {table}")
-        logger.info("Dropped existing Stage 4 tables")
+        logger.info("Dropped existing Stage 5 tables")
 
-    def initialize_stage4_schema(self):
-        """Create Stage 4 tables and indices."""
-        self.drop_stage4_tables()
+    def initialize_stage5_schema(self):
+        """Create Stage 5 tables and indices."""
+        self.drop_stage5_tables()
 
         # assertion_temporalized
         self.execute("""
@@ -578,7 +585,7 @@ class Stage4Database(Database):
         self.execute("CREATE INDEX idx_conflict_members_assertion ON conflict_members(assertion_id)")
         self.execute("CREATE INDEX idx_conflict_members_group ON conflict_members(conflict_group_id)")
 
-        logger.info("Stage 4 schema initialized")
+        logger.info("Stage 5 schema initialized")
 
     def get_predicate_id_by_label(self, label_norm: str) -> Optional[str]:
         """Look up predicate_id by normalized label."""
@@ -663,6 +670,8 @@ class Stage4Database(Database):
         """
         Iterate over all assertions in deterministic order:
         (conversation_id, order_index, message_id, assertion_id)
+
+        Includes subject_detection_tier and object_detection_tier per §5.4.0.
         """
         cursor = self.execute("""
             SELECT 
@@ -687,7 +696,9 @@ class Stage4Database(Database):
                 a.char_start,
                 a.char_end,
                 m.timestamp_quality as message_timestamp_quality,
-                a.fact_key
+                a.fact_key,
+                a.subject_detection_tier,
+                a.object_detection_tier
             FROM assertions a
             JOIN messages m ON a.message_id = m.message_id
             JOIN entities e ON a.subject_entity_id = e.entity_id
@@ -716,7 +727,9 @@ class Stage4Database(Database):
                 char_start=row["char_start"],
                 char_end=row["char_end"],
                 message_timestamp_quality=row["message_timestamp_quality"],
-                fact_key=row["fact_key"]
+                fact_key=row["fact_key"],
+                subject_detection_tier=row["subject_detection_tier"],
+                object_detection_tier=row["object_detection_tier"]
             )
 
     def get_time_mentions_for_message(self, message_id: str) -> List[TimeMentionRecord]:
@@ -866,7 +879,7 @@ class Stage4Database(Database):
 
     def iter_correction_supersessions(self) -> Iterator[Tuple[str, str]]:
         """
-        Iterate over assertions with correction supersessions from Stage 3.
+        Iterate over assertions with correction supersessions from Stage 4.
         Returns (assertion_id, superseded_by_assertion_id) pairs.
         """
         cursor = self.execute("""
@@ -949,7 +962,9 @@ class Stage4Database(Database):
                 a.char_start,
                 a.char_end,
                 m.timestamp_quality as message_timestamp_quality,
-                a.fact_key
+                a.fact_key,
+                a.subject_detection_tier,
+                a.object_detection_tier
             FROM assertions a
             JOIN messages m ON a.message_id = m.message_id
             JOIN entities e ON a.subject_entity_id = e.entity_id
@@ -979,7 +994,9 @@ class Stage4Database(Database):
                 char_start=row["char_start"],
                 char_end=row["char_end"],
                 message_timestamp_quality=row["message_timestamp_quality"],
-                fact_key=row["fact_key"]
+                fact_key=row["fact_key"],
+                subject_detection_tier=row["subject_detection_tier"],
+                object_detection_tier=row["object_detection_tier"]
             )
 
     def find_negation_targets(
@@ -1009,6 +1026,7 @@ class Stage4Database(Database):
         """
         Get assertion groups by (subject_entity_id, predicate_id) for functional invalidation.
         Only includes active assertions with valid_from_utc.
+        Includes detection tiers per §5.10.3.
         Returns (subject_entity_id, predicate_id, [assertion_records])
         """
         # First get distinct (subject, predicate) pairs
@@ -1024,7 +1042,7 @@ class Stage4Database(Database):
             subject_id = pair["subject_entity_id"]
             predicate_id = pair["predicate_id"]
 
-            # Get assertions for this group
+            # Get assertions for this group including detection tiers
             rows = self.fetchall("""
                 SELECT 
                     a.assertion_id,
@@ -1033,7 +1051,9 @@ class Stage4Database(Database):
                     at.valid_from_utc,
                     at.valid_to_utc,
                     at.status,
-                    e.entity_type as subject_entity_type
+                    e.entity_type as subject_entity_type,
+                    a.subject_detection_tier,
+                    a.object_detection_tier
                 FROM assertions a
                 JOIN assertion_temporalized at ON a.assertion_id = at.assertion_id
                 JOIN entities e ON a.subject_entity_id = e.entity_id
@@ -1091,38 +1111,56 @@ class Stage4Database(Database):
         """)
         return {row["conflict_type"]: row["cnt"] for row in rows}
 
+    def build_entity_salience_index(self) -> Dict[str, Optional[float]]:
+        """
+        Build entity salience index for conflict tie-breaks (§5.3.3).
+        Returns dict mapping entity_id to salience_score.
+        """
+        rows = self.fetchall("""
+            SELECT entity_id, salience_score
+            FROM entities
+        """)
+        return {row["entity_id"]: row["salience_score"] for row in rows}
+
 
 # ===| MAIN PIPELINE |===
 
 class TemporalReasoningPipeline:
     """
-    Stage 4: Temporal Reasoning Layer pipeline.
+    Stage 5: Temporal Reasoning Layer pipeline.
 
     Phases:
     1. Initialize schema and seed rules
-    2. Populate assertion_temporalized (valid-time assignment)
-    3. Apply Stage 3 correction supersessions
-    4. Apply retractions
-    5. Apply negation closures
-    6. Apply functional invalidation
-    7. Finalize conflicts and persist
+    2. Build entity salience index (if configured)
+    3. Populate assertion_temporalized (valid-time assignment)
+    4. Apply Stage 4 correction supersessions
+    5. Apply retractions
+    6. Apply negation closures
+    7. Apply functional invalidation
+    8. Finalize conflicts and persist
     """
 
-    def __init__(self, config: Stage4Config):
+    # Sentinel value for NULL object_detection_tier in min() calculations (§5.10.3)
+    DETECTION_TIER_NULL_SENTINEL = 5
+
+    def __init__(self, config: Stage5Config):
         self.config = config
-        self.db = Stage4Database(config.output_file_path)
+        self.db = Stage5Database(config.output_file_path)
         self.id_generator = IDGenerator(uuid.UUID(config.id_namespace))
         self.stage_started_at_utc = TimestampUtils.now_utc()
 
         # Cache for time mentions per message
         self._time_mentions_cache: Dict[str, List[TimeMentionRecord]] = {}
 
+        # Entity salience index (§5.3.3)
+        self._entity_salience: Dict[str, Optional[float]] = {}
+
         # Collected conflicts
         self._conflicts: List[ConflictGroup] = []
 
     def run(self) -> Dict[str, Any]:
-        """Execute Stage 4 pipeline. Returns statistics."""
-        logger.info("Starting Stage 4: Temporal Reasoning Layer")
+        """Execute Stage 5 pipeline. Returns statistics."""
+        logger.info("Starting Stage 5: Temporal Reasoning Layer")
         stats = {
             "assertions_total": 0,
             "assertions_temporalized": 0,
@@ -1138,7 +1176,7 @@ class TemporalReasoningPipeline:
         stats["assertions_total"] = self.db.get_assertion_count()
 
         # Initialize schema
-        self.db.initialize_stage4_schema()
+        self.db.initialize_stage5_schema()
 
         # Begin transaction
         self.db.begin()
@@ -1149,46 +1187,54 @@ class TemporalReasoningPipeline:
             rules_count = self._seed_invalidation_rules()
             logger.info(f"Seeded {rules_count} invalidation rules")
 
-            # Phase 2: Populate assertion_temporalized
-            logger.info("Phase 2: Populating assertion_temporalized (valid-time assignment)")
+            # Phase 2: Build entity salience index (§5.3.3)
+            if self.config.use_salience_conflict_tiebreak:
+                logger.info("Phase 2: Building entity salience index")
+                self._entity_salience = self.db.build_entity_salience_index()
+                logger.info(f"Built salience index with {len(self._entity_salience)} entities")
+            else:
+                logger.info("Phase 2: Skipping entity salience index (disabled)")
+
+            # Phase 3: Populate assertion_temporalized
+            logger.info("Phase 3: Populating assertion_temporalized (valid-time assignment)")
             stats["assertions_temporalized"] = self._populate_temporalized()
             logger.info(f"Temporalized {stats['assertions_temporalized']} assertions")
 
-            # Phase 3: Apply Stage 3 correction supersessions
-            logger.info("Phase 3: Applying correction supersessions from Stage 3")
+            # Phase 4: Apply Stage 4 correction supersessions
+            logger.info("Phase 4: Applying correction supersessions from Stage 4")
             stats["corrections_applied"] = self._apply_correction_supersessions()
             logger.info(f"Applied {stats['corrections_applied']} correction supersessions")
 
-            # Phase 4: Apply retractions
-            logger.info("Phase 4: Applying retractions")
+            # Phase 5: Apply retractions
+            logger.info("Phase 5: Applying retractions")
             stats["retractions_applied"] = self._apply_retractions()
             logger.info(f"Applied {stats['retractions_applied']} retractions")
 
-            # Phase 5: Apply negation closures
-            logger.info("Phase 5: Applying negation closures")
+            # Phase 6: Apply negation closures
+            logger.info("Phase 6: Applying negation closures")
             stats["negations_applied"] = self._apply_negations()
             logger.info(f"Applied {stats['negations_applied']} negation closures")
 
-            # Phase 6: Apply functional invalidation
-            logger.info("Phase 6: Applying functional invalidation")
+            # Phase 7: Apply functional invalidation
+            logger.info("Phase 7: Applying functional invalidation")
             stats["functional_supersessions"] = self._apply_functional_invalidation()
             logger.info(f"Applied {stats['functional_supersessions']} functional supersessions")
 
-            # Phase 7: Finalize conflicts
-            logger.info("Phase 7: Finalizing conflicts")
+            # Phase 8: Finalize conflicts
+            logger.info("Phase 8: Finalizing conflicts")
             self._finalize_conflicts()
             stats["conflicts_by_type"] = self.db.get_conflict_count_by_type()
             logger.info(f"Finalized {sum(stats['conflicts_by_type'].values())} conflict groups")
 
             # Commit transaction
             self.db.commit()
-            logger.info("Stage 4 completed successfully")
+            logger.info("Stage 5 completed successfully")
 
             # Add final status counts
             stats["status_counts"] = self.db.get_temporalized_count_by_status()
 
         except Exception as e:
-            logger.error(f"Stage 4 failed: {e}")
+            logger.error(f"Stage 5 failed: {e}")
             self.db.rollback()
             raise
 
@@ -1277,6 +1323,9 @@ class TemporalReasoningPipeline:
             "qualifier_interpretation": None,
             "fallback": None,
             "eligibility_reasons": [],
+            # Detection tiers for audit (§5.4.0)
+            "subject_detection_tier": assertion.subject_detection_tier,
+            "object_detection_tier": assertion.object_detection_tier,
         }
 
         # Initialize output fields
@@ -1446,7 +1495,7 @@ class TemporalReasoningPipeline:
             valid_to_utc = None
             decision_log["integrity_check"] = "VALID_TIME_NONPOSITIVE_INTERVAL"
 
-        # Store decision flags
+        # Store decision flags (§5.4.0)
         decision_log["time_source"] = time_source
         decision_log["has_explicit_valid_time"] = has_explicit_valid_time
         if fallback_blocked_reason:
@@ -1510,18 +1559,18 @@ class TemporalReasoningPipeline:
         has_explicit_valid_time: bool
     ) -> Tuple[str, List[str]]:
         """
-        Compute eligibility for temporal operations and initial status.
+        Compute eligibility for temporal operations and initial status (§5.5.2).
         Returns (status, list of ineligibility reasons).
         """
         reasons = []
 
         # Check modality
         if assertion.modality not in ('state', 'fact', 'preference'):
-            reasons.append(f"MODALITY_NOT_ELIGIBLE:{assertion.modality}")
+            reasons.append(f"MODALITY_EXCLUDED:{assertion.modality}")
 
         # Check polarity
         if assertion.polarity != 'positive':
-            reasons.append(f"POLARITY_NOT_POSITIVE:{assertion.polarity}")
+            reasons.append(f"NEGATIVE_POLARITY:{assertion.polarity}")
 
         # Check confidence
         if assertion.confidence_final < self.config.threshold_close:
@@ -1539,7 +1588,7 @@ class TemporalReasoningPipeline:
         if valid_from_utc is None:
             reasons.append("VALID_FROM_NULL")
 
-        # Check explicit valid time
+        # Check explicit valid time (§5.5.2 - key change from spec)
         if not has_explicit_valid_time:
             reasons.append("NONEXPLICIT_TIME_SOURCE")
 
@@ -1548,7 +1597,7 @@ class TemporalReasoningPipeline:
         return LifecycleStatus.ACTIVE, reasons
 
     def _apply_correction_supersessions(self) -> int:
-        """Apply correction supersessions from Stage 3."""
+        """Apply correction supersessions from Stage 4."""
         count = 0
 
         for assertion_id, superseded_by_id in self.db.iter_correction_supersessions():
@@ -1561,7 +1610,7 @@ class TemporalReasoningPipeline:
                 assertion_id=assertion_id,
                 new_status=LifecycleStatus.SUPERSEDED,
                 temporal_superseded_by=superseded_by_id,
-                append_json={"event": "CORRECTION_SUPERSESSION_FROM_STAGE3", "superseded_by": superseded_by_id, "timestamp": self.stage_started_at_utc},
+                append_json={"event": "CORRECTION_SUPERSESSION_FROM_STAGE4", "superseded_by": superseded_by_id, "timestamp": self.stage_started_at_utc},
             )
             if updated:
                 count += 1
@@ -1574,7 +1623,7 @@ class TemporalReasoningPipeline:
         return row is not None
 
     def _apply_retractions(self) -> int:
-        """Apply retractions from Stage 3."""
+        """Apply retractions from Stage 4."""
         count = 0
 
         for retraction in self.db.iter_retractions_ordered():
@@ -1717,8 +1766,22 @@ class TemporalReasoningPipeline:
 
         return count
 
+    def _compute_effective_tier(self, assertion: dict) -> int:
+        """
+        Compute effective detection tier for an assertion (§5.10.3).
+        Returns min(subject_detection_tier, object_detection_tier ?? 5).
+        """
+        subject_tier = assertion.get("subject_detection_tier")
+        object_tier = assertion.get("object_detection_tier")
+
+        # Use sentinel for NULL values
+        effective_subject = subject_tier if subject_tier is not None else self.DETECTION_TIER_NULL_SENTINEL
+        effective_object = object_tier if object_tier is not None else self.DETECTION_TIER_NULL_SENTINEL
+
+        return min(effective_subject, effective_object)
+
     def _apply_functional_invalidation(self) -> int:
-        """Apply functional invalidation rules."""
+        """Apply functional invalidation rules with detector tier tiebreaking (§5.10)."""
         count = 0
 
         for subject_id, predicate_id, assertions in self.db.get_functional_groups():
@@ -1735,7 +1798,7 @@ class TemporalReasoningPipeline:
             if rule.invalidation_policy != InvalidationPolicy.CLOSE_PREVIOUS_ON_NEWER_STATE:
                 continue
 
-            # Check eligibility for all assertions
+            # Check eligibility for all assertions (§5.10.2)
             eligible_assertions = []
             for a in assertions:
                 # Re-check eligibility (must be active and have explicit time)
@@ -1769,7 +1832,7 @@ class TemporalReasoningPipeline:
                     by_object[sig].append(a)
 
                 if len(by_object) > 1:
-                    # Object disagreement at same timepoint
+                    # Object disagreement at same timepoint (§5.10.3 step 2)
                     conflict_key = JCS.canonicalize([
                         "obj_disagree", subject_id, predicate_id, t
                     ])
@@ -1808,7 +1871,7 @@ class TemporalReasoningPipeline:
                 same_sig_assertions = list(by_object.values())[0]
 
                 if len(same_sig_assertions) > 1:
-                    # Same-time duplicates (informational)
+                    # Same-time duplicates (informational) (§5.10.3 step 3)
                     conflict_key = JCS.canonicalize([
                         "same_time_dup", subject_id, predicate_id,
                         same_sig_assertions[0]["object_signature"], t
@@ -1831,15 +1894,21 @@ class TemporalReasoningPipeline:
                     )
                     self._conflicts.append(conflict)
 
-                # Select representative (highest confidence, then assertion_id)
+                # Select representative W(t) deterministically (§5.10.3 step 4)
+                # Sort by: confidence_final DESC, min_tier ASC, subject_detection_tier ASC, assertion_id ASC
                 sorted_assertions = sorted(
                     same_sig_assertions,
-                    key=lambda a: (-a["confidence_final"], a["assertion_id"])
+                    key=lambda a: (
+                        -a["confidence_final"],
+                        self._compute_effective_tier(a),
+                        a.get("subject_detection_tier") if a.get("subject_detection_tier") is not None else self.DETECTION_TIER_NULL_SENTINEL,
+                        a["assertion_id"]
+                    )
                 )
                 winner = sorted_assertions[0]
                 representatives.append((t, winner))
 
-            # Walk timepoints to supersede
+            # Walk timepoints to supersede (§5.10.4)
             if len(representatives) < 2:
                 continue
 
@@ -1882,10 +1951,38 @@ class TemporalReasoningPipeline:
                     prev_t, prev_a, prev_status = cur_t, cur_a, cur_status
                     continue
 
-                # Check confidence margin
+                # Check confidence margin and detector tier tiebreak (§5.10.4)
                 confidence_diff = cur_a["confidence_final"] - prev_a["confidence_final"]
+                supersession_reason = None
+                should_supersede = False
+                should_conflict = False
+
+                # Compute detection tiers for tiebreaking
+                cur_tier = self._compute_effective_tier(cur_a)
+                prev_tier = self._compute_effective_tier(prev_a)
+
                 if confidence_diff >= self.config.confidence_supersession_margin:
-                    # Supersede prev
+                    # Clear confidence winner
+                    should_supersede = True
+                    supersession_reason = "CONFIDENCE_MARGIN"
+                elif self.config.use_detector_tier_tiebreak and abs(confidence_diff) < self.config.confidence_supersession_margin:
+                    # Confidence too close, use detector tier tiebreak
+                    if cur_tier < prev_tier:
+                        # cur has higher reliability (lower tier number)
+                        should_supersede = True
+                        supersession_reason = "DETECTOR_TIER_TIEBREAK"
+                    elif cur_tier > prev_tier:
+                        # prev has higher reliability - treat as conflict
+                        should_conflict = True
+                    else:
+                        # Same tier and confidence too close - conflict
+                        should_conflict = True
+                else:
+                    # Confidence too close without tier tiebreak
+                    should_conflict = True
+
+                if should_supersede:
+                    # Supersede prev at time cur_t
                     existing_valid_to = prev_temporal.get("valid_to_utc") if prev_temporal else None
                     new_valid_to = TimestampUtils.min_time(existing_valid_to, cur_t)
 
@@ -1900,13 +1997,17 @@ class TemporalReasoningPipeline:
                             "superseded_by": cur_a["assertion_id"],
                             "rule_id": rule.rule_id,
                             "valid_to_utc": new_valid_to,
+                            "supersession_reason": supersession_reason,
+                            "confidence_diff": confidence_diff,
+                            "prev_tier": prev_tier,
+                            "cur_tier": cur_tier,
                             "timestamp": self.stage_started_at_utc
                         }
                     )
                     if updated:
                         count += 1
-                else:
-                    # Confidence too close
+                elif should_conflict:
+                    # Confidence too close - create conflict
                     conflict_key = JCS.canonicalize([
                         "conf_close", subject_id, predicate_id,
                         prev_a["assertion_id"], cur_a["assertion_id"]
@@ -1921,9 +2022,20 @@ class TemporalReasoningPipeline:
                         raw_conflict_json=JCS.canonicalize({
                             "prev_assertion_id": prev_a["assertion_id"],
                             "prev_confidence": prev_a["confidence_final"],
+                            "prev_detection_tier": prev_tier,
                             "cur_assertion_id": cur_a["assertion_id"],
                             "cur_confidence": cur_a["confidence_final"],
-                            "margin_required": self.config.confidence_supersession_margin
+                            "cur_detection_tier": cur_tier,
+                            "margin_required": self.config.confidence_supersession_margin,
+                            "confidence_diff": confidence_diff,
+                            "subject_detection_tiers": {
+                                "prev": prev_a.get("subject_detection_tier"),
+                                "cur": cur_a.get("subject_detection_tier")
+                            },
+                            "object_detection_tiers": {
+                                "prev": prev_a.get("object_detection_tier"),
+                                "cur": cur_a.get("object_detection_tier")
+                            }
                         }),
                         member_assertion_ids=[prev_a["assertion_id"], cur_a["assertion_id"]]
                     )
@@ -1952,8 +2064,8 @@ class TemporalReasoningPipeline:
             self.db.insert_conflict_group(conflict)
 
 
-def run_stage4(config: Stage4Config) -> Dict[str, Any]:
-    """Run Stage 4 pipeline on existing database."""
+def run_stage5(config: Stage5Config) -> Dict[str, Any]:
+    """Run Stage 5 pipeline on existing database."""
     pipeline = TemporalReasoningPipeline(config)
     return pipeline.run()
 
@@ -1961,7 +2073,7 @@ def run_stage4(config: Stage4Config) -> Dict[str, Any]:
 if __name__ == "__main__":
     from argparse import ArgumentParser
 
-    parser = ArgumentParser(description="Run Stage 4: Temporal Reasoning Layer")
+    parser = ArgumentParser(description="Run Stage 5: Temporal Reasoning Layer")
     parser.add_argument(
         "--db",
         type=Path,
@@ -1998,6 +2110,16 @@ if __name__ == "__main__":
         help="Disable asserted_at fallback for valid_from"
     )
     parser.add_argument(
+        "--no-detector-tier-tiebreak",
+        action="store_true",
+        help="Disable detector tier as tie-breaker in supersession"
+    )
+    parser.add_argument(
+        "--use-salience-tiebreak",
+        action="store_true",
+        help="Enable entity salience in conflict resolution tie-breaks"
+    )
+    parser.add_argument(
         "--namespace",
         type=str,
         default="550e8400-e29b-41d4-a716-446655440000",
@@ -2017,19 +2139,21 @@ if __name__ == "__main__":
     # Resolve rules path
     rules_path = args.rules if args.rules.exists() else None
 
-    config = Stage4Config(
+    config = Stage5Config(
         output_file_path=args.db,
         invalidation_rules_path=rules_path,
         id_namespace=args.namespace,
         time_link_proximity_chars=args.time_link_proximity,
         threshold_close=args.threshold_close,
         confidence_supersession_margin=args.confidence_margin,
-        fallback_valid_from_asserted=not args.no_fallback
+        fallback_valid_from_asserted=not args.no_fallback,
+        use_detector_tier_tiebreak=not args.no_detector_tier_tiebreak,
+        use_salience_conflict_tiebreak=args.use_salience_tiebreak
     )
 
-    stats = run_stage4(config)
+    stats = run_stage5(config)
 
-    logger.info("\n=== Stage 4 Summary ===")
+    logger.info("\n=== Stage 5 Summary ===")
     logger.info(f"Total assertions: {stats['assertions_total']}")
     logger.info(f"Assertions temporalized: {stats['assertions_temporalized']}")
     logger.info(f"Corrections applied: {stats['corrections_applied']}")

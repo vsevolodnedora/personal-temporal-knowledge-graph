@@ -1,0 +1,537 @@
+# =============================================================================
+# Stage 6: Temporal Profile Configuration
+# =============================================================================
+# This configuration controls how temporal profiles are generated for entities
+# in the knowledge graph. Temporal profiles partition assertions into time
+# windows and cluster them semantically to show how an entity's attributes
+# evolve over time.
+#
+# The classification system uses a three-tier approach:
+#   Tier 1: Strong deterministic keyword rules (fastest, most reliable)
+#   Tier 2: Predicate embedding clustering (requires sentence-transformers)
+#   Tier 3: LLM consensus fallback (most flexible, requires API access)
+# =============================================================================
+
+temporal_profile_config:
+
+  # ===========================================================================
+  # CLASSIFICATION STRATEGY
+  # ===========================================================================
+  # Controls which classification tiers are used and in what order.
+  #
+  # Options:
+  #   - "rules_only":  Use only Tier 1 keyword rules. Fast and deterministic.
+  #                    Unmatched assertions go to "unclassified" category.
+  #
+  #   - "hybrid":      Try Tier 1 first, then Tier 2 (predicate clustering),
+  #                    then optionally Tier 3 (LLM) for remaining items.
+  #                    Best balance of speed and coverage.
+  #
+  #   - "llm_only":    Skip Tier 1 and 2, use LLM for all classifications.
+  #                    Slowest but most flexible for novel predicates.
+  #
+  # Default: "hybrid"
+  # ===========================================================================
+  classification_strategy: "hybrid"
+
+
+  # ===========================================================================
+  # WINDOW PARTITIONING
+  # ===========================================================================
+  # Controls how time is divided into discrete windows for analysis.
+  # ===========================================================================
+
+  # Available granularities to generate. Multiple granularities create
+  # separate profile views at different time scales.
+  # Options: "month", "quarter", "year"
+  # Default: ["month", "quarter", "year"]
+  window_granularities:
+    - "month"
+    - "quarter"
+    - "year"
+
+  # Primary granularity used for clustering and evolution tracking.
+  # Should be one of the values in window_granularities.
+  # Default: "month"
+  default_granularity: "month"
+
+  # Minimum number of assertions required in a window for it to be included.
+  # Windows with fewer assertions are merged or excluded.
+  # Lower values = more granular profiles, higher values = less noise.
+  # Default: 1
+  window_min_assertions: 1
+
+
+  # ===========================================================================
+  # TIER 1: STRONG DETERMINISTIC KEYWORD RULES
+  # ===========================================================================
+  # Fast, deterministic classification based on keyword matching in predicate
+  # labels and assertion surface text. These rules are applied first and take
+  # precedence over other classification methods.
+  #
+  # Each category maps to a list of keywords/phrases. If any keyword appears
+  # in the predicate label or surface text, the assertion is classified into
+  # that category. First match wins (categories are checked in order).
+  #
+  # Categories should align with SemanticCategory enum values:
+  #   project, interest, problem, task, desire, plan, unclassified
+  # ===========================================================================
+  strong_rule_keywords:
+
+    # PROJECT: Work, development, creation activities
+    # Examples: "I work on X", "I'm building Y", "developing Z"
+    project:
+      - "work"
+      - "build"
+      - "building"
+      - "develop"
+      - "developing"
+      - "create"
+      - "creating"
+      - "start"
+      - "started"
+      - "implement"
+      - "implementing"
+      - "design"
+      - "designing"
+      - "launch"
+      - "launching"
+      - "maintain"
+      - "maintaining"
+      - "contribute"
+      - "contributing"
+      - "project"
+      - "codebase"
+      - "repository"
+      - "app"
+      - "application"
+      - "system"
+      - "platform"
+      - "service"
+      - "tool"
+
+    # INTEREST: Preferences, hobbies, things the user enjoys
+    # Examples: "I like X", "I enjoy Y", "interested in Z"
+    interest:
+      - "like"
+      - "likes"
+      - "enjoy"
+      - "enjoys"
+      - "enjoying"
+      - "love"
+      - "loves"
+      - "loving"
+      - "prefer"
+      - "prefers"
+      - "interest"
+      - "interested"
+      - "curious"
+      - "fascinate"
+      - "fascinated"
+      - "hobby"
+      - "hobbies"
+      - "fan of"
+      - "fond of"
+      - "passion"
+      - "passionate"
+      - "favorite"
+      - "favourite"
+      - "into"  # "I'm into X"
+
+    # PROBLEM: Issues, bugs, difficulties the user is experiencing
+    # Examples: "I have an issue with X", "struggling with Y"
+    problem:
+      - "issue"
+      - "issues"
+      - "problem"
+      - "problems"
+      - "bug"
+      - "bugs"
+      - "error"
+      - "errors"
+      - "fail"
+      - "fails"
+      - "failed"
+      - "failing"
+      - "broken"
+      - "break"
+      - "stuck"
+      - "trouble"
+      - "troubleshoot"
+      - "difficult"
+      - "difficulty"
+      - "struggle"
+      - "struggling"
+      - "can't"
+      - "cannot"
+      - "unable"
+      - "doesn't work"
+      - "not working"
+      - "crash"
+      - "crashing"
+      - "debug"
+      - "debugging"
+
+    # TASK: To-do items, obligations, scheduled activities
+    # Examples: "I need to X", "I should Y", "deadline for Z"
+    task:
+      - "todo"
+      - "to-do"
+      - "to do"
+      - "need to"
+      - "needs to"
+      - "must"
+      - "should"
+      - "have to"
+      - "has to"
+      - "plan to"
+      - "planning to"
+      - "going to"
+      - "gonna"
+      - "will"
+      - "deadline"
+      - "due"
+      - "due date"
+      - "assignment"
+      - "task"
+      - "tasks"
+      - "finish"
+      - "complete"
+      - "deliver"
+      - "submit"
+      - "reminder"
+
+    # DESIRE: Wishes, hopes, aspirations
+    # Examples: "I want X", "I wish Y", "my goal is Z"
+    desire:
+      - "want"
+      - "wants"
+      - "wanting"
+      - "wish"
+      - "wishes"
+      - "wishing"
+      - "hope"
+      - "hopes"
+      - "hoping"
+      - "dream"
+      - "dreams"
+      - "dreaming"
+      - "aspire"
+      - "aspires"
+      - "aspiration"
+      - "goal"
+      - "goals"
+      - "aim"
+      - "aims"
+      - "aiming"
+      - "objective"
+      - "ambition"
+      - "would like"
+      - "looking forward"
+
+    # PLAN: Future intentions, strategies, scheduled events
+    # Examples: "I'm planning X", "my strategy for Y"
+    plan:
+      - "schedule"
+      - "scheduled"
+      - "scheduling"
+      - "planning"
+      - "planned"
+      - "intend"
+      - "intends"
+      - "intending"
+      - "intention"
+      - "strategy"
+      - "strategic"
+      - "roadmap"
+      - "milestone"
+      - "milestones"
+      - "timeline"
+      - "agenda"
+      - "calendar"
+      - "upcoming"
+      - "next week"
+      - "next month"
+      - "next year"
+      - "future"
+      - "eventually"
+      - "someday"
+
+
+  # ===========================================================================
+  # TIER 2: PREDICATE EMBEDDING CLUSTERING
+  # ===========================================================================
+  # Uses sentence embeddings to cluster predicates by semantic similarity.
+  # Requires sentence-transformers library: pip install sentence-transformers
+  #
+  # How it works:
+  #   1. Embed all predicate labels using the specified model
+  #   2. Compare embeddings to category exemplar predicates
+  #   3. Assign to category if similarity exceeds threshold
+  # ===========================================================================
+
+  # Enable/disable Tier 2 clustering.
+  # Set to false if sentence-transformers is not installed.
+  # Default: true
+  enable_predicate_clustering: true
+
+  # Sentence embedding model for predicate similarity.
+  # Options (from HuggingFace):
+  #   - "all-MiniLM-L6-v2"       (fast, 384-dim, good general purpose)
+  #   - "all-mpnet-base-v2"     (slower, 768-dim, better quality)
+  #   - "paraphrase-MiniLM-L6-v2" (optimized for paraphrase detection)
+  # Default: "all-MiniLM-L6-v2"
+  predicate_cluster_model: "all-MiniLM-L6-v2"
+
+  # Random seed for reproducible clustering.
+  # Default: 42
+  predicate_cluster_seed: 42
+
+  # Minimum cosine similarity required to assign a predicate to a category.
+  # Higher values = stricter matching, more items fall through to Tier 3/unclassified.
+  # Range: 0.0 to 1.0
+  # Default: 0.75
+  predicate_cluster_threshold: 0.75
+
+  # Exemplar predicates for each category.
+  # The embedding of new predicates is compared against these exemplars.
+  # Add domain-specific predicates relevant to your use case.
+  predicate_cluster_categories:
+
+    project:
+      - "works_on"
+      - "develops"
+      - "maintains"
+      - "contributes_to"
+      - "builds"
+      - "created"
+      - "owns"
+      - "leads"
+      - "manages"
+      - "implements"
+      - "architected"
+      - "designed"
+
+    interest:
+      - "interested_in"
+      - "enjoys"
+      - "likes"
+      - "loves"
+      - "follows"
+      - "watches"
+      - "reads"
+      - "plays"
+      - "collects"
+      - "studies"
+      - "practices"
+      - "fan_of"
+
+    problem:
+      - "struggles_with"
+      - "blocked_by"
+      - "debugging"
+      - "investigating"
+      - "troubleshooting"
+      - "fixing"
+      - "broken_by"
+      - "confused_about"
+      - "frustrated_with"
+      - "stuck_on"
+
+    task:
+      - "needs_to"
+      - "assigned_to"
+      - "responsible_for"
+      - "working_toward"
+      - "committed_to"
+      - "scheduled_for"
+      - "deadline_for"
+      - "must_complete"
+
+    desire:
+      - "wants"
+      - "wishes_for"
+      - "hopes_to"
+      - "dreams_of"
+      - "aspires_to"
+      - "aims_for"
+      - "seeks"
+      - "craves"
+
+    plan:
+      - "plans_to"
+      - "intends_to"
+      - "scheduled"
+      - "will_do"
+      - "going_to"
+      - "preparing_for"
+      - "organizing"
+
+
+  # ===========================================================================
+  # TIER 3: LLM CONSENSUS FALLBACK
+  # ===========================================================================
+  # Uses an LLM to classify assertions that weren't matched by Tier 1 or 2.
+  # Runs multiple inference passes and requires consensus for reliability.
+  #
+  # Requires an OpenAI-compatible API endpoint.
+  # ===========================================================================
+
+  # Enable/disable Tier 3 LLM fallback.
+  # Only used if classification_strategy is "hybrid" or "llm_only".
+  # Default: false
+  enable_llm_cluster_fallback: false
+
+  # LLM model identifier.
+  # Examples: "gpt-4o-mini", "claude-3-haiku-20240307", "llama-3.1-8b"
+  # Default: null (must be set if enable_llm_cluster_fallback is true)
+  llm_cluster_model: "gpt-4o-mini"
+
+  # Base URL for OpenAI-compatible API.
+  # Examples:
+  #   - "https://api.openai.com/v1" (OpenAI)
+  #   - "https://api.anthropic.com/v1" (Anthropic)
+  #   - "http://localhost:11434/v1" (Ollama)
+  # Default: null (uses OPENAI_API_BASE env var if not set)
+  llm_cluster_api_base: null
+
+  # Number of LLM inference runs per assertion.
+  # Higher = more reliable consensus, but slower and more expensive.
+  # Default: 5
+  llm_cluster_runs: 5
+
+  # Minimum number of runs that must agree for consensus.
+  # Must be <= llm_cluster_runs.
+  # Example: 4 out of 5 runs must agree (80% consensus).
+  # Default: 4
+  llm_cluster_consensus_threshold: 4
+
+  # Minimum entity salience score to consider for LLM classification.
+  # Low-salience entities are skipped to save API costs.
+  # Range: 0.0 to 1.0
+  # Default: 0.5
+  llm_cluster_min_salience: 0.5
+
+  # LLM sampling temperature.
+  # 0.0 = deterministic, higher = more random.
+  # For classification, 0.0 is recommended for consistency.
+  # Default: 0.0
+  llm_cluster_temperature: 0.0
+
+  # Random seed for LLM inference (if supported by the API).
+  # Default: 42
+  llm_cluster_seed: 42
+
+
+  # ===========================================================================
+  # WINDOW SALIENCE COMPUTATION
+  # ===========================================================================
+  # Controls how entity salience is recomputed within each time window.
+  # Salience determines which entities are most important in a window.
+  #
+  # Formula: salience = (frequency * w1) + (recency * w2) + (confidence * w3)
+  # Where weights w1 + w2 + w3 should equal 1.0.
+  # ===========================================================================
+
+  # Decay factor for salience over time.
+  # Applied exponentially: older windows have salience * (decay ^ age_in_windows).
+  # Range: 0.0 to 1.0 (1.0 = no decay)
+  # Default: 0.9
+  window_salience_decay: 0.9
+
+  # Weight for assertion frequency (how often the entity appears).
+  # Higher values prioritize entities mentioned frequently.
+  # Default: 0.4
+  window_salience_frequency_weight: 0.4
+
+  # Weight for recency (how recently the entity was mentioned).
+  # Higher values prioritize recently mentioned entities.
+  # Default: 0.3
+  window_salience_recency_weight: 0.3
+
+  # Weight for confidence (average extraction confidence).
+  # Higher values prioritize high-confidence assertions.
+  # Default: 0.3
+  window_salience_confidence_weight: 0.3
+
+
+  # ===========================================================================
+  # OUTPUT CONTROL
+  # ===========================================================================
+  # Controls what gets included in the generated temporal profile nodes/edges.
+  # ===========================================================================
+
+  # Maximum number of entities to include per semantic cluster.
+  # Limits output size for clusters with many members.
+  # Entities are sorted by salience; top K are included.
+  # Default: 10
+  top_k_per_cluster: 10
+
+  # Whether to create a cluster for assertions that couldn't be classified.
+  # If true, creates an "unclassified" cluster in each window.
+  # If false, unclassified assertions are silently dropped.
+  # Default: true
+  include_unclassified_cluster: true
+
+
+# =============================================================================
+# USAGE EXAMPLES
+# =============================================================================
+#
+# Example 1: Fast, deterministic classification (rules only)
+# -----------------------------------------------------------
+# temporal_profile_config:
+#   classification_strategy: "rules_only"
+#   window_granularities: ["month"]
+#   default_granularity: "month"
+#   window_min_assertions: 1
+#   enable_predicate_clustering: false
+#   enable_llm_cluster_fallback: false
+#   include_unclassified_cluster: true
+#
+#
+# Example 2: Hybrid with embedding clustering (no LLM)
+# -----------------------------------------------------------
+# temporal_profile_config:
+#   classification_strategy: "hybrid"
+#   window_granularities: ["month", "quarter"]
+#   default_granularity: "month"
+#   window_min_assertions: 3
+#   enable_predicate_clustering: true
+#   predicate_cluster_model: "all-mpnet-base-v2"
+#   predicate_cluster_threshold: 0.70
+#   enable_llm_cluster_fallback: false
+#   top_k_per_cluster: 15
+#
+#
+# Example 3: Full hybrid with LLM fallback
+# -----------------------------------------------------------
+# temporal_profile_config:
+#   classification_strategy: "hybrid"
+#   window_granularities: ["month", "quarter", "year"]
+#   default_granularity: "month"
+#   window_min_assertions: 5
+#   enable_predicate_clustering: true
+#   predicate_cluster_threshold: 0.80
+#   enable_llm_cluster_fallback: true
+#   llm_cluster_model: "gpt-4o-mini"
+#   llm_cluster_runs: 3
+#   llm_cluster_consensus_threshold: 2
+#   llm_cluster_min_salience: 0.6
+#
+#
+# Example 4: LLM-only classification (maximum flexibility)
+# -----------------------------------------------------------
+# temporal_profile_config:
+#   classification_strategy: "llm_only"
+#   window_granularities: ["quarter"]
+#   default_granularity: "quarter"
+#   window_min_assertions: 10
+#   enable_predicate_clustering: false
+#   enable_llm_cluster_fallback: true
+#   llm_cluster_model: "gpt-4o"
+#   llm_cluster_runs: 5
+#   llm_cluster_consensus_threshold: 4
+#   llm_cluster_temperature: 0.0
+#
+# =============================================================================
