@@ -3352,10 +3352,10 @@ class AssertionExtractionPipeline:
         )
         # Mark the target assertion as superseded
         if target_assertion_id:
-            supersession_type = "retracted" if rc.retraction_type == RetractionType.FULL else rc.retraction_type
+            supersession_type = "retraction" if rc.retraction_type == RetractionType.FULL else rc.retraction_type
             self.db.update_assertion_supersession(
                 assertion_id=target_assertion_id,
-                superseded_by=replacement_assertion_id or retraction_id,  # Use retraction_id if no replacement
+                superseded_by=replacement_assertion_id,  # Only use actual assertion IDs, None is fine
                 supersession_type=supersession_type,
             )
 

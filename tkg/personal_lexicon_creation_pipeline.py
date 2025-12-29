@@ -17,19 +17,15 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum, IntEnum
-from pathlib import Path
-from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
-
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Iterator
 import pendulum
 
+
 # Import shared utilities from extraction pipeline
-from tkg.extraction_pipeline import (
-    PipelineConfig,
-    JCS,
-    IDGenerator,
-    TimestampUtils,
-)
+
 from tkg.database_base import Database
 from tkg.hash_utils import HashUtils
 
@@ -38,12 +34,184 @@ from tkg.hash_utils import HashUtils
 from tkg.logger import get_logger
 logger = get_logger(__name__)
 
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+class JCS:
+    """
+    JSON Canonicalization Scheme (RFC 8785) implementation.
+
+    Provides deterministic JSON serialization for hashing and ID generation.
+    All JSON stored in the database MUST pass through this canonicalizer.
+    """
+
+    @staticmethod
+    def canonicalize(obj: Any) -> str:
+        """Convert Python object to JCS-canonical JSON string."""
+        return JCS._serialize(obj)
+
+    @staticmethod
+    def canonicalize_bytes(obj: Any) -> bytes:
+        """Convert to canonical JSON and encode as UTF-8."""
+        return JCS.canonicalize(obj).encode('utf-8')
+
+    @staticmethod
+    def _serialize(obj: Any) -> str:
+        """Recursively serialize object to JCS-canonical form."""
+        if obj is None:
+            return 'null'
+        elif isinstance(obj, bool):
+            return 'true' if obj else 'false'
+        elif isinstance(obj, int):
+            return str(obj)
+        elif isinstance(obj, float):
+            if obj != obj:  # NaN
+                raise ValueError("NaN is not allowed in JCS")
+            if obj == float('inf') or obj == float('-inf'):
+                raise ValueError("Infinity is not allowed in JCS")
+            s = repr(obj)
+            if 'e' in s or 'E' in s:
+                s = s.lower()
+            return s
+        elif isinstance(obj, str):
+            return JCS._escape_string(obj)
+        elif isinstance(obj, (list, tuple)):
+            items = ','.join(JCS._serialize(item) for item in obj)
+            return f'[{items}]'
+        elif isinstance(obj, dict):
+            sorted_keys = sorted(obj.keys(), key=lambda k: k.encode('utf-16-be'))
+            items = ','.join(
+                f'{JCS._escape_string(k)}:{JCS._serialize(obj[k])}'
+                for k in sorted_keys
+            )
+            return '{' + items + '}'
+        else:
+            raise TypeError(f"Cannot serialize {type(obj)} to JCS")
+
+    @staticmethod
+    def _escape_string(s: str) -> str:
+        """Escape a string for JSON according to RFC 8785."""
+        result = ['"']
+        for char in s:
+            code = ord(char)
+            if char == '"':
+                result.append('\\"')
+            elif char == '\\':
+                result.append('\\\\')
+            elif char == '\b':
+                result.append('\\b')
+            elif char == '\f':
+                result.append('\\f')
+            elif char == '\n':
+                result.append('\\n')
+            elif char == '\r':
+                result.append('\\r')
+            elif char == '\t':
+                result.append('\\t')
+            elif code < 0x20:
+                result.append(f'\\u{code:04x}')
+            else:
+                result.append(char)
+        result.append('"')
+        return ''.join(result)
+
+
+class IDGenerator:
+    """Basic deterministic UUID generation using namespace-based UUIDv5."""
+
+    def __init__(self, namespace: uuid.UUID):
+        """Initialize with namespace UUID."""
+        self.namespace = namespace
+
+    def generate(self, components: List[Any]) -> str:
+        """Generate UUIDv5 from component array."""
+        encoded = []
+        for c in components:
+            if c is None:
+                encoded.append("__NULL__")
+            elif c == "":
+                encoded.append("__EMPTY__")
+            else:
+                encoded.append(c)
+
+        name = JCS.canonicalize(encoded)
+        return str(uuid.uuid5(self.namespace, name))
+
+
+class TimestampUtils:
+    """
+    Store timestamps as canonical UTC ISO-8601 strings with milliseconds:
+    YYYY-MM-DDTHH:MM:SS.sssZ
+    """
+    ISO_UTC_MILLIS = "YYYY-MM-DD[T]HH:mm:ss.SSS[Z]"
+
+    @staticmethod
+    def now_utc() -> str:
+        return pendulum.now("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+    @staticmethod
+    def normalize_to_utc(timestamp: Any, source_tz: str | None = None) -> str | None:
+        if timestamp is None:
+            return None
+
+        try:
+            if isinstance(timestamp, (int, float)):
+                dt = pendulum.from_timestamp(timestamp, tz="UTC")
+                return dt.format(TimestampUtils.ISO_UTC_MILLIS)
+
+            if isinstance(timestamp, datetime):
+                dt = pendulum.instance(timestamp)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=pendulum.timezone(source_tz or "UTC"))
+                return dt.in_timezone("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+            if isinstance(timestamp, str):
+                s = timestamp.strip()
+                dt = pendulum.parse(s, tz=source_tz or "UTC", strict=False)
+                return dt.in_timezone("UTC").format(TimestampUtils.ISO_UTC_MILLIS)
+
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def parse_iso(iso_string: str) -> datetime | None:
+        try:
+            return pendulum.parse(iso_string, strict=False)
+        except Exception:
+            return None
+
+    @staticmethod
+    def compare(ts1: str | None, ts2: str | None) -> int:
+        """Compare two UTC ISO strings. Returns -1, 0, or 1."""
+        if ts1 is None and ts2 is None:
+            return 0
+        if ts1 is None:
+            return 1
+        if ts2 is None:
+            return -1
+        return -1 if ts1 < ts2 else (1 if ts1 > ts2 else 0)
+
+    @staticmethod
+    def min_time(ts1: str | None, ts2: str | None) -> str | None:
+        """Return the earlier of two timestamps, handling NULLs."""
+        if ts1 is None:
+            return ts2
+        if ts2 is None:
+            return ts1
+        return ts1 if ts1 < ts2 else ts2
+
+
 # ===| CONFIGURATION |===
 
 @dataclass
-class Stage2Config(PipelineConfig):
+class Stage2Config:
     """Configuration for Stage 2 pipeline."""
+
+    output_file_path:Path | None = None
     anchor_timezone: str = "UTC"
+    id_namespace: str = "550e8400-e29b-41d4-a716-446655440000"
 
     # Entity detection
     ignore_markdown_blockquotes: bool = True  # Exclude blockquotes from entity detection
