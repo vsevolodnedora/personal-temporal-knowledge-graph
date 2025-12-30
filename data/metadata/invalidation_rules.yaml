@@ -1,0 +1,317 @@
+# Invalidation Rules for Personal Knowledge Graph
+# ================================================
+#
+# This file defines functional predicates - predicates where only one value
+# can be true at a time for a given subject. When a newer assertion with a
+# different object value is encountered, the previous assertion is automatically
+# closed (its valid_to_utc is set to the new assertion's valid_from_utc).
+#
+# Rule fields:
+#   - predicate_label: The normalized predicate label (matches predicates.canonical_label_norm)
+#   - predicate_id: Alternative to predicate_label - use the predicate's UUID directly
+#   - subject_entity_type: Entity type this rule applies to (e.g., PERSON, ORG, or '*' for all)
+#   - is_functional: If true, only one object value is valid at any time
+#   - invalidation_policy:
+#       - 'none': No automatic invalidation
+#       - 'close_previous_on_newer_state': Close previous assertion when new one arrives
+#
+# Rules are matched by priority:
+#   1. Exact (predicate_id, subject_entity_type) match
+#   2. (predicate_id, '*') match
+#   3. (NULL, subject_entity_type) match
+#   4. Default rule (NULL, '*')
+
+rules:
+# ============================================================================
+  # EMPLOYMENT & PROFESSIONAL
+  # ============================================================================
+
+  - predicate_label: works_at
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: employed_by
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: job_title
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: occupation
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: employer
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # LOCATION & RESIDENCE
+  # ============================================================================
+
+  - predicate_label: lives_in
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: resides_in
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_city
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_country
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: home_address
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # RELATIONSHIPS & FAMILY
+  # ============================================================================
+
+  - predicate_label: married_to
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: spouse
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: partner
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: dating
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # EDUCATION
+  # ============================================================================
+
+  - predicate_label: studies_at
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_school
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_major
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # PERSONAL STATE & PREFERENCES
+  # ============================================================================
+
+  - predicate_label: age
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: weight
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: health_status
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_goal
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: primary_language
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # TECHNOLOGY & TOOLS
+  # ============================================================================
+
+  - predicate_label: uses_phone
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: uses_laptop
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: primary_ide
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: primary_os
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # ORGANIZATION ATTRIBUTES
+  # ============================================================================
+
+  - predicate_label: ceo
+    subject_entity_type: ORG
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: headquarters
+    subject_entity_type: ORG
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: employee_count
+    subject_entity_type: ORG
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # PETS
+  # ============================================================================
+
+  - predicate_label: primary_pet
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # PERSONAL PROJECTS
+  # (Model as "current/primary" to keep functional semantics.
+  # If you want multiple active projects, prefer a non-functional predicate like has_project.)
+  # ============================================================================
+
+  - predicate_label: current_personal_project
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: primary_personal_project
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # TRAVEL
+  # (Functional "current/next" travel state; past trips should be non-functional)
+  # ============================================================================
+
+  - predicate_label: current_trip
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: next_trip
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: current_travel_destination
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # ACADEMIC CAREER (Physics, Chemistry)
+  # (Functional "current" academic state; degrees/publications should remain non-functional)
+  # ============================================================================
+
+  - predicate_label: academic_position
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: academic_department
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: academic_field
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # Optional: if you distinguish “primary research area” from “academic_field”
+  - predicate_label: primary_research_area
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # LANGUAGE LEARNING (German)
+  # (Learning target and proficiency are functional; "speaks_language" remains non-functional)
+  # ============================================================================
+
+  - predicate_label: learning_language
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: target_language
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  - predicate_label: language_proficiency
+    subject_entity_type: PERSON
+    is_functional: true
+    invalidation_policy: close_previous_on_newer_state
+
+  # ============================================================================
+  # NON-FUNCTIONAL PREDICATES (explicit overrides)
+  # These predicates can have multiple simultaneous values
+  # ============================================================================
+
+  - predicate_label: speaks_language
+    subject_entity_type: PERSON
+    is_functional: false
+    invalidation_policy: none
+
+  - predicate_label: has_skill
+    subject_entity_type: PERSON
+    is_functional: false
+    invalidation_policy: none
+
+  - predicate_label: interested_in
+    subject_entity_type: PERSON
+    is_functional: false
+    invalidation_policy: none
+
+  - predicate_label: friend_of
+    subject_entity_type: PERSON
+    is_functional: false
+    invalidation_policy: none
+
+  - predicate_label: member_of
+    subject_entity_type: PERSON
+    is_functional: false
+    invalidation_policy: none

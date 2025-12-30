@@ -370,7 +370,7 @@ class TemporalProfileConfig:
     granularity: str = "month"
     focal_entities: Optional[List[str]] = None
     allowed_assertion_statuses: List[str] = field(
-        default_factory=lambda: ["active"]
+        default_factory=lambda: ["ineligible"]
     )
     window_min_assertions: int = 1
     salience_weights: Dict[str, float] = field(
@@ -429,7 +429,7 @@ class TemporalProfileConfig:
             granularity=config_data.get('granularity', 'month'),
             focal_entities=config_data.get('focal_entities'),
             allowed_assertion_statuses=config_data.get(
-                'allowed_assertion_statuses', ['active']
+                'allowed_assertion_statuses', ['ineligible']
             ),
             window_min_assertions=config_data.get('window_min_assertions', 1),
             salience_weights=config_data.get('salience_weights', {
@@ -803,7 +803,6 @@ class NodeGenerator:
                    aliases_json, status, first_seen_at_utc, last_seen_at_utc,
                    mention_count, conversation_count, salience_score
             FROM entities
-            WHERE status = 'active'
             ORDER BY entity_id ASC
         """)
 
@@ -1940,7 +1939,6 @@ class EdgeGenerator:
             JOIN lexicon_terms lt ON em.detector LIKE 'LEXICON:%'
             JOIN entities e ON em.entity_id = e.entity_id
             WHERE em.entity_id IS NOT NULL
-              AND e.status = 'active'
             ORDER BY em.entity_id ASC, lt.term_id ASC
         """)
 
@@ -2004,7 +2002,7 @@ class TemporalProfileGenerator:
             result = []
             for entity_id in self.profile_config.focal_entities:
                 exists = self.db.fetchone(
-                    "SELECT entity_id FROM entities WHERE entity_id = ? AND status = 'active'",
+                    "SELECT entity_id FROM entities WHERE entity_id = ?",
                     (entity_id,)
                 )
                 if exists:
@@ -2016,7 +2014,7 @@ class TemporalProfileGenerator:
         # Try SELF entity
         self_entity = self.db.fetchone("""
             SELECT entity_id FROM entities
-            WHERE entity_key = '__SELF__' AND entity_type = 'PERSON' AND status = 'active'
+            WHERE entity_key = '__SELF__' AND entity_type = 'PERSON'
             ORDER BY entity_id ASC
             LIMIT 1
         """)
@@ -3089,7 +3087,7 @@ class DataQualityChecker:
         report = DataQualityReport()
 
         # Entity count
-        result = self.db.fetchone("SELECT COUNT(*) as cnt FROM entities WHERE status = 'active'")
+        result = self.db.fetchone("SELECT COUNT(*) as cnt FROM entities")
         report.entity_count = result['cnt'] if result else 0
 
         # Predicate count
@@ -3149,7 +3147,7 @@ class DataQualityChecker:
         # SELF presence
         result = self.db.fetchone("""
             SELECT entity_id FROM entities
-            WHERE entity_key = '__SELF__' AND entity_type = 'PERSON' AND status = 'active'
+            WHERE entity_key = '__SELF__' AND entity_type = 'PERSON'
             LIMIT 1
         """)
         report.self_entity_id = result['entity_id'] if result else None

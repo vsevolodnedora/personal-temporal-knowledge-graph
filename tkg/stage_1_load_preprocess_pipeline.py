@@ -17,18 +17,67 @@ from collections import defaultdict
 from enum import StrEnum
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
-from typing import List, Any, TypedDict, Iterator
+from typing import List, Any, TypedDict, Iterator, Optional
 
 from jsonpointer import resolve_pointer, JsonPointerException
 import pendulum
 from datetime import datetime
 import yaml
 
-from tkg.hash_utils import HashUtils
-from tkg.database_base import Database
-
 from tkg.logger import get_logger
 logger = get_logger(__name__)
+
+class HashUtils:
+    """SHA-256 hashing utilities for fingerprints and content hashing."""
+
+    @staticmethod
+    def sha256_hex(data: bytes) -> str:
+        """Compute SHA-256 hash, return lowercase hex string."""
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def sha256_string(s: str) -> str:
+        """Compute SHA-256 of UTF-8 encoded string."""
+        return HashUtils.sha256_hex(s.encode('utf-8'))
+
+    @staticmethod
+    def compute_surface_hash(surface_text: Optional[str]) -> str:
+        """Compute hash for surface text, handling NULL case."""
+        if surface_text is None:
+            return HashUtils.sha256_string("__NO_SURFACE__")
+        return HashUtils.sha256_string(surface_text)
+
+class Database:
+    """Interface for the SQLite database."""
+
+    def __init__(self, database_path: Path):
+        self.database_path = database_path
+        logger.info(f"Opening database {str(database_path)}")
+        self.connection = sqlite3.connect(str(database_path))
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._in_transaction = False
+
+    def begin(self):
+        """Begin transaction."""
+        self._in_transaction = True
+        self.connection.execute("BEGIN TRANSACTION")
+
+    def rollback(self):
+        """Rollback current transaction."""
+        self.connection.rollback()
+        self._in_transaction = False
+
+    def commit(self):
+        """Commit transaction."""
+        if not self._in_transaction:
+            raise RuntimeError("Cannot commit if not in transaction")
+        self.connection.commit()
+        self._in_transaction = False
+
+    def close(self):
+        """Close database connection."""
+        self.connection.close()
 
 # ===| CONFIG |===
 
