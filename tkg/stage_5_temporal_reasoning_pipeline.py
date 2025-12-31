@@ -9,11 +9,6 @@ knowledge graph. It processes assertions from Stage 4 to:
 4. Apply negation closures
 5. Apply functional invalidation rules
 6. Detect and materialize conflicts
-
-Key invariants:
-- Deterministic iteration order: (conversation_id ASC, order_index ASC, message_id ASC, assertion_id ASC)
-- Single transaction: commit all or rollback all
-- All decisions logged in raw_temporalize_json / raw_conflict_json
 """
 import hashlib
 import json

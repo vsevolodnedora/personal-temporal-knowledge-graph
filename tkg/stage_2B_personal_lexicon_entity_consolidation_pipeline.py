@@ -5,12 +5,6 @@ Objectives:
 1. Induce a personal term lexicon from corpus patterns (project codenames, acronyms, nicknames)
 2. Run LexiconMatch detector to emit learned terms with exact offsets
 3. Consolidate all emitted mentions into canonical entities
-
-Non-negotiables:
-- Lossless + replayable: lexicon induction fully logged; all candidates stored
-- Deterministic: stable candidate generators, scoring, and selection
-- Role-aware trust: user-weighted counts prioritized over assistant
-- Transactional: Stage 2B is one transaction
 """
 import hashlib
 import json

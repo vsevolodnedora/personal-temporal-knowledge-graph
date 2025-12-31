@@ -5,12 +5,6 @@ Builds a lossless detection layer over Stage 1 text by producing:
 1. Entity mention candidates with offset-correct spans
 2. Time mentions with conservative resolution anchored to message time
 3. Deterministic overlap resolution to emit winning mentions
-
-Non-negotiables:
-- Lossless + replayable: every detector output is stored
-- Offsets are sacred: spans refer to messages.text_raw exactly
-- Deterministic ordering: fixed detector order, fixed scoring/tie-breaks
-- Transactional: Stage 2A is one transaction; commit or rollback
 """
 import hashlib
 import json

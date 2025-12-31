@@ -3,9 +3,6 @@ Stage 6: Graph Materialization
 
 Materializes deterministic, read-only graph tables (graph_nodes, graph_edges) for
 visualization and export. Projects data from Stages 1-5 into a stable graph shape.
-
-Primary visualization target: a SELF-centered temporal profile suitable for
-"monthly clusters of what mattered".
 """
 import hashlib
 import json

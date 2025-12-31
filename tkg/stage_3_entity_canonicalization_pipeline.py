@@ -3,12 +3,6 @@ Stage 3: Entity Canonicalization Layer
 
 Refines entity canonical names using detector-weighted, role-weighted mention evidence
 from Stage 2, producing a fully auditable refinement trail without altering entity identity.
-
-Key invariants:
-- entity_id and entity_key remain immutable (identity preserved)
-- aliases_json unchanged (lossless surface accumulation from Stage 2)
-- Deterministic selection with stable tie-breaks
-- Single transaction: commit all or rollback all
 """
 import logging
 import sqlite3

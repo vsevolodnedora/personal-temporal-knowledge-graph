@@ -2,8 +2,6 @@
 Builds a semantic-lossless, bitemporal personal knowledge graph from ChatGPT
 conversations.json with conservative temporal anchoring and deterministic,
 auditable transformations.
-Currently implemented:
-- Stage 1: Load and Preprocess raw conversations.json with deterministic transformations and indexing
 """
 
 from argparse import ArgumentParser

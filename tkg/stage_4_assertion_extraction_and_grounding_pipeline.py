@@ -4,12 +4,6 @@ Stage 4: Assertion Extraction & Grounding Layer
 Converts Stage 1-3 evidence (messages + refined entities + time mentions) into
 auditable, replayable assertions with deterministic IDs, conservative span handling,
 detector-aware entity reliability, and role-aware trust.
-
-Outputs:
-- predicates: normalized relation vocabulary
-- assertions: grounded semantic claims with entity/literal objects
-- retractions: explicit negations or corrections linked to prior assertions
-- Optional LLM extraction artifacts (llm_extraction_runs, llm_extraction_calls)
 """
 
 import hashlib
